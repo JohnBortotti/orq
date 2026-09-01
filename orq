@@ -729,6 +729,18 @@ def cmd_send(args):
     # mostra sugestao contextual indistinguivel de texto digitado, e ele
     # enfileira sozinho o que chega durante a geracao. Cola e manda.
     paste_into(reg["pane"], args.text, enter=not args.no_enter)
+
+    # Input novo significa que ele nao esta mais "done". Sem isto o registro
+    # mentiria no follow-up: o pai manda mais trabalho e o `ls` continua
+    # mostrando terminado. Quando os hooks chegarem eles sobrescrevem com
+    # `working`; ate la, limpar e' melhor que afirmar o que nao e' verdade.
+    if reg.get("status"):
+        def mutate(st):
+            a = (st.get("agents") or {}).get(args.name)
+            if a is not None:
+                a.pop("status", None); a.pop("status_at", None)
+        update_state(ws, mutate)
+
     log_event(cmd="send", ws=ws, name=args.name, pane=reg["pane"],
               chars=len(args.text), enter=not args.no_enter, ok=True)
 
@@ -738,6 +750,58 @@ def cmd_keys(args):
     tmux("send-keys", "-t", reg["pane"], *args.keys)
     log_event(cmd="keys", ws=ws, name=args.name, pane=reg["pane"],
               keys=args.keys, ok=True)
+
+
+def cmd_done(args):
+    """Fecha o turno: grava o status no registro e avisa o pai.
+
+    NAO mata o pane. `done` quer dizer "terminei meu turno", nao "o trabalho
+    acabou" -- o trabalho acaba no merge e a faxina e' do `wt rm`. O pane fica
+    de pe com a conversa na tela, pronto pra follow-up sem custo de --resume.
+
+    Nao existe `orq wait` do outro lado: o pai que encerrou o turno ja esta
+    ocioso esperando input, e este send chega como mensagem nova e o acorda.
+    """
+    nome = caller_agent()
+    if not nome:
+        raise OrqError(
+            "`done` so vale de dentro do pane de um agente registrado — "
+            "$TMUX_PANE nao casa com nenhum agente do registro"
+        )
+    ws, reg = find_agent(nome)
+
+    agora = datetime.now(timezone.utc).astimezone().isoformat()
+
+    def mutate(st):
+        a = (st.get("agents") or {}).get(nome)
+        if a is not None:
+            a["status"] = "done"
+            a["status_at"] = agora
+    update_state(ws, mutate)
+
+    destino = args.to or reg.get("parent")
+    msg = f"[{nome}] done" + (f": {args.msg}" if args.msg else "")
+
+    # O status e' gravado antes de tentar entregar, e nao e' desfeito se a
+    # entrega falhar: quem terminou terminou, exista ou nao destinatario.
+    if not destino:
+        log_event(cmd="done", ws=ws, name=nome, pane=reg["pane"], to=None,
+                  msg=args.msg, delivered=False, reason="sem pai", ok=True)
+        print(f"{nome}: status done gravado")
+        print("  ninguem avisado — sem pai no registro e sem --to")
+        return
+
+    try:
+        _, reg_pai = find_agent(destino)
+    except OrqError as e:
+        log_event(cmd="done", ws=ws, name=nome, pane=reg["pane"], to=destino,
+                  msg=args.msg, delivered=False, reason=str(e), ok=False)
+        raise OrqError(f"status done gravado, mas '{destino}' nao foi avisado: {e}")
+
+    paste_into(reg_pai["pane"], msg)
+    log_event(cmd="done", ws=ws, name=nome, pane=reg["pane"], to=destino,
+              to_pane=reg_pai["pane"], msg=args.msg, delivered=True, ok=True)
+    print(f"{nome}: status done gravado; avisei '{destino}' ({reg_pai['pane']})")
 
 
 def cmd_read(args):
@@ -866,7 +930,8 @@ def fmt_pane(p):
     nome = p["name"] or "-"
     pai = f" <- {p['parent']}" if p["parent"] else ""
     sil = " zzz" if p["silence"] else ""
-    return f"    {p['pane']}  {nome}  {p['command']}{pai}{sil}"
+    st = f" [{p['status']}]" if p.get("status") else ""
+    return f"    {p['pane']}  {nome}  {p['command']}{pai}{st}{sil}"
 
 
 def cmd_ls(args):
@@ -904,6 +969,9 @@ def cmd_ls(args):
                 "name": reg["name"] if reg else None,
                 "provider": reg.get("provider") if reg else None,
                 "parent": reg.get("parent") if reg else None,
+                # `done` nao mata o pane, entao "pane vivo" nao distingue mais
+                # trabalhando de terminado. O status e' o que distingue.
+                "status": reg.get("status") if reg else None,
                 "command": p["command"],
                 # O flag de silencio vem cru do tmux: repassar o dado nao e'
                 # construir deteccao de ociosidade (que foi cortada).
@@ -996,7 +1064,7 @@ def cmd_log(args):
 
 def todo(name):
     def _(args):
-        raise OrqError(f"`{name}` ainda nao implementado (batch 2)")
+        raise OrqError(f"`{name}` ainda nao implementado")
     return _
 
 
@@ -1059,9 +1127,9 @@ def build_parser():
     sp.add_argument("name"); sp.add_argument("--lines", type=int, default=200)
     sp.set_defaults(func=cmd_read)
 
-    sp = sub.add_parser("done", help="fecha o turno")
+    sp = sub.add_parser("done", help="fecha o turno: grava status e avisa o pai")
     sp.add_argument("msg", nargs="?", default=""); sp.add_argument("--to")
-    sp.set_defaults(func=todo("done"))
+    sp.set_defaults(func=cmd_done)
 
     sp = sub.add_parser("ls", help="arvore workspace -> worktree -> panes")
     sp.add_argument("--json", action="store_true"); sp.add_argument("--ws")
