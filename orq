@@ -11,6 +11,7 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -33,6 +34,18 @@ PROVIDERS = HOME / "providers.yml"
 WORKSPACES = HOME / "workspaces"
 STATE = HOME / "state"
 LOG = HOME / "log.jsonl"
+HOOKS = HOME / "hooks"
+
+# Evento do agente -> status no registro. UM comando serve os tres: o payload
+# do hook traz `hook_event_name`, entao a tabela mora aqui em vez de virar tres
+# entradas diferentes no settings do provider.
+# ⚠️ `waiting` nao e' universal entre providers; a coluna admite ausencia em vez
+# de fingir (o orq so implementa Claude Code na v1).
+HOOK_STATUS = {
+    "UserPromptSubmit": "working",
+    "Stop": "done",
+    "Notification": "waiting",
+}
 # schedules NAO moram aqui: a unidade systemd e' a unica fonte de verdade.
 
 # Detalhe #5: `:` e `.` sao separadores de alvo do tmux (sessao:janela.pane).
@@ -407,7 +420,63 @@ def provider_cmd(nome_provider, session_id):
     # Detalhe #3: o session_id e' GERADO pelo orq, nao raspado da tela — assim
     # ele e' conhecido antes de o agente subir e o `--resume` ja tem o que
     # precisa. Providers que nao suportam simplesmente nao usam o placeholder.
-    return cmd.replace("{session_id}", session_id)
+    cmd = cmd.replace("{session_id}", session_id)
+    # Mesmo contrato do {session_id}: e' placeholder na TABELA. Provider que
+    # nao tem hook simplesmente nao usa, e cai no fallback de leitura de tela.
+    if "{hooks}" in cmd:
+        cmd = cmd.replace("{hooks}", shlex.quote(str(hooks_file(nome_provider))))
+    return cmd
+
+
+def hooks_file(provider):
+    """Settings de hooks do provider, gerado pelo orq, e devolve o path.
+
+    Fica FORA do settings global do agente de proposito: `claude --settings`
+    SOMA em vez de substituir, entao o orq nunca reescreve o
+    ~/.claude/settings.json do usuario -- que aqui ja tem seis hooks de outra
+    ferramenta -- e o hook so vale pros agentes que o orq subiu.
+    """
+    HOOKS.mkdir(parents=True, exist_ok=True)
+    exe = shlex.quote(str(Path(sys.argv[0]).resolve()))
+    # `|| true`: hook que falha nao pode atrapalhar o agente.
+    entrada = [{"hooks": [{"type": "command",
+                           "command": f"{exe} _status || true",
+                           "timeout": 5}]}]
+    doc = {"hooks": {ev: entrada for ev in HOOK_STATUS}}
+    path = HOOKS / f"{provider}.json"
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(doc, indent=2, ensure_ascii=False))
+    os.replace(tmp, path)
+    return path
+
+
+def set_status(ws, nome, status):
+    agora = datetime.now(timezone.utc).astimezone().isoformat()
+
+    def mutate(st):
+        a = (st.get("agents") or {}).get(nome)
+        if a is not None:
+            a["status"] = status
+            a["status_at"] = agora
+    update_state(ws, mutate)
+
+
+def agent_by(sid, pane):
+    """Acha o agente pelo session_id -- que e' identificador do ORQ, nao do
+    multiplexer -- caindo pro pane do tmux quando o provider nao o reporta."""
+    if not WORKSPACES.exists():
+        return None, None
+    todos = []
+    for f in sorted(WORKSPACES.glob("*.yml")):
+        for nome, reg in (read_state(f.stem).get("agents") or {}).items():
+            todos.append((f.stem, nome, reg))
+    for chave, valor in (("session_id", sid), ("pane", pane)):
+        if not valor:
+            continue
+        for ws, nome, reg in todos:
+            if reg.get(chave) == valor:
+                return ws, nome
+    return None, None
 
 
 def paste_into(pane, texto, enter=True):
@@ -770,14 +839,7 @@ def cmd_done(args):
         )
     ws, reg = find_agent(nome)
 
-    agora = datetime.now(timezone.utc).astimezone().isoformat()
-
-    def mutate(st):
-        a = (st.get("agents") or {}).get(nome)
-        if a is not None:
-            a["status"] = "done"
-            a["status_at"] = agora
-    update_state(ws, mutate)
+    set_status(ws, nome, "done")
 
     destino = args.to or reg.get("parent")
     msg = f"[{nome}] done" + (f": {args.msg}" if args.msg else "")
@@ -802,6 +864,28 @@ def cmd_done(args):
     log_event(cmd="done", ws=ws, name=nome, pane=reg["pane"], to=destino,
               to_pane=reg_pai["pane"], msg=args.msg, delivered=True, ok=True)
     print(f"{nome}: status done gravado; avisei '{destino}' ({reg_pai['pane']})")
+
+
+def cmd_status_hook(args):
+    """Chamado PELO agente, via hook do provider. Le o payload no stdin e
+    traduz o evento em status.
+
+    Silencioso por contrato, e engole toda excecao: hook que fala polui a tela
+    do agente e hook que quebra atrapalha o turno dele. Nao escreve no
+    log.jsonl -- o log e' de comandos que alguem emitiu, e o estado vive no
+    registro, que ja sai por `orq ls --json`.
+    """
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+        status = HOOK_STATUS.get(payload.get("hook_event_name"))
+        if not status:
+            return
+        ws, nome = agent_by(payload.get("session_id"),
+                            os.environ.get("TMUX_PANE"))
+        if ws:
+            set_status(ws, nome, status)
+    except Exception:
+        return
 
 
 def cmd_read(args):
@@ -1130,6 +1214,10 @@ def build_parser():
     sp = sub.add_parser("done", help="fecha o turno: grava status e avisa o pai")
     sp.add_argument("msg", nargs="?", default=""); sp.add_argument("--to")
     sp.set_defaults(func=cmd_done)
+
+    sp = sub.add_parser("_status",
+                        help="interno: o hook do agente reporta o estado dele")
+    sp.set_defaults(func=cmd_status_hook)
 
     sp = sub.add_parser("ls", help="arvore workspace -> worktree -> panes")
     sp.add_argument("--json", action="store_true"); sp.add_argument("--ws")
