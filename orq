@@ -55,9 +55,14 @@ HOOK_STATUS = {
 }
 # schedules NAO moram aqui: a unidade systemd e' a unica fonte de verdade.
 
-# Detalhe #5: `:` e `.` sao separadores de alvo do tmux (sessao:janela.pane).
-# TODO(joao): o plano se contradiz — a classe original incluia `.` mas a prosa
-# ao lado o proibia. Esta e' a versao estrita; confirmar antes da Fase 2.
+# Detalhe #5: `:` e `.` sao separadores de alvo do tmux (sessao:janela.pane),
+# entao nenhum dos dois entra em nome de workspace, worktree ou agente -- um
+# nome com ponto viraria alvo ambiguo em todo `-t` do codigo.
+# ⚠️ Decidido assim em 01/09/2026, resolvendo uma contradicao do plano (a classe
+# original incluia `.`, a prosa ao lado o proibia). O custo e' cosmetico e
+# conhecido: repo com ponto no nome (`docs.site`, `api.v2`) vira `docs-site`,
+# `api-v2`. Isto PRECISA estar no SKILL.md, senao um agente tenta `api.v2` e
+# leva erro sem entender por que.
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_/-]*$")
 
 # Janela que nasce junto com a sessao, no `root:` do workspace. Nao e' worktree:
@@ -332,12 +337,19 @@ def split_target(target):
     return repo, slug
 
 
+def ws_arg(args):
+    """--ws vence o posicional. Os dois existem em todo comando que aceita
+    workspace; a assimetria antiga (posicional obrigatorio em `up`/`attach`,
+    so `--ws` no resto) custava erro de digitacao a quem le a superficie."""
+    return getattr(args, "ws", None) or getattr(args, "ws_pos", None)
+
+
 def resolve_ws(explicit):
     """Workspace explicito, ou inferido da sessao tmux atual quando se esta
     dentro do socket do orq.
 
-    TODO(joao): a assinatura de `wt new` no plano nao tem --ws e nao diz como
-    inferir. Esta e' a leitura obvia; confirmar.
+    O plano nao dizia como inferir; esta leitura rodou o dia 01/09 inteiro sem
+    atrito e foi confirmada. Precedencia: explicito > inferido da sessao.
     """
     if explicit:
         return explicit
@@ -569,7 +581,7 @@ def wait_for_ready(pane, binario, ready_when, blocked_when):
 # --- comandos ---------------------------------------------------------------
 
 def cmd_up(args, quiet=False):
-    ws = args.ws
+    ws = resolve_ws(ws_arg(args))
     cfg = workspace_config(ws)
     session = cfg.get("session") or ws
     if not session_exists(session):
@@ -596,15 +608,16 @@ def cmd_up(args, quiet=False):
 
 
 def cmd_attach(args):
-    cfg = workspace_config(args.ws)
-    session = cfg.get("session") or args.ws
+    ws = resolve_ws(ws_arg(args))
+    cfg = workspace_config(ws)
+    session = cfg.get("session") or ws
     if not session_exists(session):
-        raise OrqError(f"sessao '{session}' nao existe — rode `orq up {args.ws}`")
+        raise OrqError(f"sessao '{session}' nao existe — rode `orq up {ws}`")
     os.execvp("tmux", ["tmux", "-L", SOCKET, "attach", "-t", session])
 
 
 def cmd_wt_new(args):
-    ws = resolve_ws(args.ws)
+    ws = resolve_ws(ws_arg(args))
     cfg = workspace_config(ws)
     session = cfg.get("session") or ws
     repo, slug = split_target(args.target)
@@ -662,9 +675,19 @@ def cmd_wt_new(args):
     if ops["copied"] or ops["linked"]:
         print(f"  files: {len(ops['copied'])} copiados, {len(ops['linked'])} linkados")
 
+    # `wt new` + `spawn` e' a sequencia mais comum do orq. A flag existia no
+    # parser desde a Fase 1 e nunca era lida: aceitava e ignorava em silencio,
+    # que e' pior que nao existir -- os stubs pelo menos recusam falando.
+    if args.spawn:
+        nome = args.as_name or slug.replace("/", "-")
+        cmd_spawn(argparse.Namespace(
+            name=nome, ws=ws, ws_pos=None, wt=window, provider=args.spawn,
+            cmd_str=None, prompt=args.prompt, parent=None, split=False,
+        ))
+
 
 def cmd_wt_rm(args):
-    ws = resolve_ws(args.ws)
+    ws = resolve_ws(ws_arg(args))
     cfg = workspace_config(ws)
     session = cfg.get("session") or ws
     repo, slug = split_target(args.target)
@@ -776,7 +799,7 @@ def cmd_spawn(args):
         raise OrqError(f"nome invalido: '{args.name}' (esperado {NAME_RE.pattern})")
     if args.cmd_str and args.prompt:
         raise OrqError("--prompt so faz sentido com provider, nao com --cmd")
-    ws = resolve_ws(args.ws)
+    ws = resolve_ws(ws_arg(args))
     cfg = workspace_config(ws)
     session = cfg.get("session") or ws
 
@@ -1019,7 +1042,8 @@ def cmd_resurrect(args):
     prompt, e' julgamento — e julgamento e' trabalho de agente lendo o log,
     nao de comando.
     """
-    workspaces = [args.ws] if args.ws else sorted(
+    _ws = ws_arg(args)
+    workspaces = [_ws] if _ws else sorted(
         p.stem for p in WORKSPACES.glob("*.yml")) if WORKSPACES.exists() else []
     plano, orfaos = [], []
     for ws in workspaces:
@@ -1121,7 +1145,8 @@ def fmt_pane(p):
 
 
 def cmd_ls(args):
-    workspaces = [args.ws] if args.ws else sorted(
+    _ws = ws_arg(args)
+    workspaces = [_ws] if _ws else sorted(
         p.stem for p in WORKSPACES.glob("*.yml")
     ) if WORKSPACES.exists() else []
     tree = []
@@ -1231,6 +1256,7 @@ def cmd_ls(args):
 
 
 def cmd_log(args):
+    _ws = ws_arg(args)
     if not LOG.exists():
         return
     with open(LOG) as f:
@@ -1242,7 +1268,7 @@ def cmd_log(args):
                 ev = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if args.ws and ev.get("ws") != args.ws:
+            if _ws and ev.get("ws") != _ws:
                 continue
             if args.action and ev.get("cmd") != args.action:
                 continue
@@ -1263,38 +1289,55 @@ def build_parser():
     p = argparse.ArgumentParser(prog="orq", description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    # Workspace: posicional OU --ws, em TODOS os comandos que o aceitam.
+    # Antes `up`/`attach` exigiam posicional e o resto so aceitava --ws; a
+    # assimetria era defensavel (um nao tem sessao pra inferir, o outro tem)
+    # mas custava erro de digitacao a quem le -- inclusive a agente lendo o
+    # SKILL.md, onde errar o comando custa um turno. Precedencia:
+    # --ws > posicional > inferido da sessao tmux.
     sp = sub.add_parser("up", help="cria a sessao do workspace (idempotente)")
-    sp.add_argument("ws"); sp.set_defaults(func=cmd_up)
+    sp.add_argument("ws_pos", nargs="?", metavar="ws")
+    sp.add_argument("--ws"); sp.set_defaults(func=cmd_up)
 
     sp = sub.add_parser("attach", help="tmux attach no workspace")
-    sp.add_argument("ws"); sp.set_defaults(func=cmd_attach)
+    sp.add_argument("ws_pos", nargs="?", metavar="ws")
+    sp.add_argument("--ws"); sp.set_defaults(func=cmd_attach)
 
     sp = sub.add_parser("wt", help="worktree: new | rm")
     wt = sp.add_subparsers(dest="wt_cmd", required=True)
     new = wt.add_parser("new", help="cria worktree + janela, base fresca de origin")
     new.add_argument("target", help="<repo>/<slug>")
+    new.add_argument("ws_pos", nargs="?", metavar="ws")
     new.add_argument("--branch", required=True)
     new.add_argument("--base")
     new.add_argument("--ws")
     new.add_argument("--no-fetch", action="store_true")
-    new.add_argument("--spawn", metavar="PROVIDER")
+    new.add_argument("--spawn", metavar="PROVIDER",
+                     help="sobe um agente no worktree recem-criado")
+    new.add_argument("--as", dest="as_name", metavar="NOME",
+                     help="nome do agente do --spawn (default: o slug)")
+    new.add_argument("--prompt", help="prompt inicial, com --spawn")
     new.add_argument("--no-files", action="store_true")
     new.add_argument("--no-hooks", action="store_true")
     new.set_defaults(func=cmd_wt_new)
     rm = wt.add_parser("rm", help="remove worktree e janela; nunca apaga branch")
-    rm.add_argument("target"); rm.add_argument("--ws")
+    rm.add_argument("target")
+    rm.add_argument("ws_pos", nargs="?", metavar="ws")
+    rm.add_argument("--ws")
     rm.add_argument("--force", action="store_true")
     rm.set_defaults(func=cmd_wt_rm)
 
     sp = sub.add_parser("resurrect", help="recria janelas que cairam")
     sp.add_argument("--dry-run", action="store_true")
+    sp.add_argument("ws_pos", nargs="?", metavar="ws")
     sp.add_argument("--ws")
     sp.set_defaults(func=cmd_resurrect)
 
     sp = sub.add_parser("spawn",
                         help="sobe um terminal/agente num worktree; sem --wt "
                              "nasce no root do workspace (janela _lead)")
-    sp.add_argument("name"); sp.add_argument("--wt")
+    sp.add_argument("name"); sp.add_argument("ws_pos", nargs="?", metavar="ws")
+    sp.add_argument("--wt")
     sp.add_argument("--provider"); sp.add_argument("--cmd", dest="cmd_str")
     sp.add_argument("--prompt"); sp.add_argument("--parent")
     sp.add_argument("--split", action="store_true"); sp.add_argument("--ws")
@@ -1325,10 +1368,12 @@ def build_parser():
     sp.set_defaults(func=cmd_status_hook)
 
     sp = sub.add_parser("ls", help="arvore workspace -> worktree -> panes")
+    sp.add_argument("ws_pos", nargs="?", metavar="ws")
     sp.add_argument("--json", action="store_true"); sp.add_argument("--ws")
     sp.set_defaults(func=cmd_ls)
 
     sp = sub.add_parser("log", help="filtro sobre o log.jsonl")
+    sp.add_argument("ws_pos", nargs="?", metavar="ws")
     sp.add_argument("--since"); sp.add_argument("--ws"); sp.add_argument("--action")
     sp.set_defaults(func=cmd_log)
 
