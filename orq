@@ -186,12 +186,40 @@ def session_exists(ws):
     return tmux("has-session", "-t", f"={ws}", check=False).returncode == 0
 
 
+def pane_procs(pane_pid):
+    """Comandos que rodam DENTRO do pane: o processo do proprio pane mais os
+    descendentes.
+
+    Existe porque `pane_current_command` mente conforme o pane nasceu. Medido
+    em 01/09/2026 com dois Claude identicos na mesma janela: o que TOMOU um
+    shell existente (send-keys) reporta `claude`; o que veio de `split-window`
+    com o comando reporta `bash`, mesmo tendo `claude` como filho em
+    foreground. Isso furava a recusa de "agente vivo" do `wt rm` do segundo
+    agente em diante -- a mesma trava que o `-s` do list-panes ja tinha furado.
+    """
+    if not pane_pid:
+        return []
+    vistos, fila, saida = set(), [str(pane_pid)], []
+    while fila:
+        pid = fila.pop()
+        if pid in vistos:
+            continue
+        vistos.add(pid)
+        r = run(["ps", "-o", "comm=", "-p", pid], check=False)
+        nome = r.stdout.strip()
+        if nome:
+            saida.append(nome)
+        r = run(["ps", "-o", "pid=", "--ppid", pid], check=False)
+        fila.extend(x.strip() for x in r.stdout.split() if x.strip())
+    return saida
+
+
 def list_panes(ws=None):
     """Panes vivos no socket do orq, como lista de dicts."""
     fmt = "\t".join([
         "#{session_name}", "#{window_name}", "#{pane_id}",
         "#{pane_current_command}", "#{pane_current_path}",
-        "#{window_activity_flag}", "#{window_silence_flag}",
+        "#{window_activity_flag}", "#{window_silence_flag}", "#{pane_pid}",
     ])
     # `-s` e' obrigatorio: sem ele, `-t <sessao>` lista so os panes da janela
     # ATIVA, e nao os da sessao inteira. Isso escondia panes do `ls` e furava
@@ -203,12 +231,17 @@ def list_panes(ws=None):
     out = []
     for line in p.stdout.splitlines():
         parts = line.split("\t")
-        if len(parts) != 7:
+        if len(parts) != 8:
             continue
-        out.append(dict(zip(
-            ["session", "window", "pane", "command", "path", "activity", "silence"],
+        d = dict(zip(
+            ["session", "window", "pane", "command", "path", "activity",
+             "silence", "pid"],
             parts,
-        )))
+        ))
+        # `command` vem do tmux e mente conforme o pane nasceu; `procs` e' a
+        # verdade da arvore. Quem decide algo olha `procs`.
+        d["procs"] = pane_procs(d["pid"])
+        out.append(d)
     return out
 
 
@@ -653,13 +686,20 @@ def cmd_wt_rm(args):
         pendentes = unpushed_commits(dst, branch)
         if pendentes:
             recusas.append(f"{len(pendentes)} commit(s) fora do origin em '{branch}'")
-        # "Agente vivo" = o processo do pane e' um provider. Bash esquecido
-        # no prompt nao trava.
+        # "Agente vivo" = um provider rodando DENTRO do pane. Olha a arvore de
+        # processos, nao o `pane_current_command`: este ultimo reporta o shell
+        # pros panes nascidos de split-window, e escondia todo agente a partir
+        # do segundo. Bash esquecido no prompt continua nao travando.
         conhecidos = set(providers_config())
-        vivos = [p for p in list_panes(session)
-                 if p["window"] == window and p["command"] in conhecidos]
+        vivos = []
+        for p in list_panes(session):
+            if p["window"] != window:
+                continue
+            achados = [c for c in p["procs"] if c in conhecidos]
+            if achados:
+                vivos.append((achados[0], p["pane"]))
         if vivos:
-            nomes = ", ".join(f"{p['command']}@{p['pane']}" for p in vivos)
+            nomes = ", ".join(f"{c}@{pane}" for c, pane in vivos)
             recusas.append(f"agente vivo dentro ({nomes})")
         if recusas:
             log_event(cmd="wt rm", ws=ws, wt=window, ok=False, refused=recusas)
@@ -668,16 +708,67 @@ def cmd_wt_rm(args):
                 f"  use --force pra remover mesmo assim (a branch NUNCA e' apagada)"
             )
 
+    # Os arquivos que o orq colocou sao untracked pro git, entao sem isto o
+    # `git worktree remove` recusa SEMPRE que o workspace tem `files:` — a
+    # checagem de sujeira ja os descontava e a remocao nao, o que travava o
+    # comando por incoerencia. Symlink sai sempre (o alvo nao e' tocado);
+    # copia so sai se estiver IDENTICA a origem, senao e' edicao do usuario e
+    # vira recusa em vez de perda silenciosa.
+    meus = read_state(ws).get("worktrees", {}).get(window, {}).get("orq_files", [])
+    # DUAS passadas: classifica tudo, decide, so entao apaga. Numa passada so,
+    # a recusa chegava depois de ja ter apagado os itens anteriores da lista.
+    aptos, mexidos = [], []
+    for rel in meus:
+        alvo = dst / rel
+        if alvo.is_symlink():
+            aptos.append(rel)                    # o alvo do link nao e' tocado
+        elif alvo.is_file():
+            origem = src / rel
+            igual = origem.is_file() and origem.read_bytes() == alvo.read_bytes()
+            (aptos if (igual or args.force) else mexidos).append(rel)
+        elif alvo.is_dir():
+            aptos.append(rel)
+    if mexidos:
+        log_event(cmd="wt rm", ws=ws, wt=window, ok=False, modified=mexidos)
+        raise OrqError(
+            f"recusado: {', '.join(mexidos)} — o orq colocou esse(s) arquivo(s) "
+            f"aqui, mas voce editou desde entao.\n"
+            f"  salve o que interessa e rode de novo, ou use --force pra perder"
+        )
+
+    apagados = []
+    for rel in aptos:
+        alvo = dst / rel
+        if alvo.is_symlink() or alvo.is_file():
+            alvo.unlink()
+        elif alvo.is_dir():
+            shutil.rmtree(alvo)
+        apagados.append(rel)
+
+    # O git PRIMEIRO. Ao contrario, uma recusa do git deixava a janela morta e
+    # o worktree de pe: perdiam-se os panes e nao se removia nada.
+    try:
+        git(src, "worktree", "remove", str(dst),
+            *(["--force"] if args.force else []))
+    except OrqError:
+        # A remocao falhou DEPOIS de eu tirar os arquivos que o orq pos aqui.
+        # Sem devolver, o worktree sobrevive mutilado -- sem .env e sem
+        # node_modules a app nao sobe, e nada na tela explicaria por que.
+        if apagados:
+            apply_file_ops(cfg, src, dst)
+        raise
     if window_exists(session, window):
         tmux("kill-window", "-t", f"={session}:{window}")
-    git(src, "worktree", "remove", str(dst), *(["--force"] if args.force else []))
 
     def mutate(state):
         state.get("worktrees", {}).pop(window, None)
     update_state(ws, mutate)
 
-    log_event(cmd="wt rm", ws=ws, wt=window, path=str(dst), forced=args.force, ok=True)
+    log_event(cmd="wt rm", ws=ws, wt=window, path=str(dst), forced=args.force,
+              orq_files_removed=apagados, ok=True)
     print(f"{window} removido (branch preservada)")
+    if apagados:
+        print(f"  apagados (postos pelo orq): {', '.join(apagados)}")
 
 
 def cmd_spawn(args):
@@ -737,8 +828,12 @@ def cmd_spawn(args):
     # um bash que ninguem pediu.
     panes = [p for p in list_panes(session) if p["window"] == window]
     registrados = {a["pane"] for a in (state.get("agents") or {}).values()}
+    # Livre = shell parado de verdade. `command in SHELLS` sozinho nao basta:
+    # pane com agente vivo tambem reporta shell quando nasceu de split-window,
+    # e tomar esse pane colaria o launch por cima de um agente trabalhando.
     livres = [p for p in panes if p["pane"] not in registrados
-              and p["command"] in SHELLS]
+              and p["command"] in SHELLS
+              and all(c in SHELLS for c in p["procs"])]
     # Janela que o proprio spawn acabou de criar tem um pane so, novo e de
     # ninguem — nao precisa da heuristica de shell parado, e nao pode usa-la:
     # por ~50ms depois do `new-window` o tmux ainda reporta `tmux` como
@@ -1063,7 +1158,10 @@ def cmd_ls(args):
                 # `done` nao mata o pane, entao "pane vivo" nao distingue mais
                 # trabalhando de terminado. O status e' o que distingue.
                 "status": reg.get("status") if reg else None,
-                "command": p["command"],
+                # o comando real da arvore; `pane_current_command` reporta o
+                # shell pros panes de split-window e mentia na tela.
+                "command": next((c for c in p["procs"] if c not in SHELLS),
+                                p["command"]),
                 # O flag de silencio vem cru do tmux: repassar o dado nao e'
                 # construir deteccao de ociosidade (que foi cortada).
                 "silence": p["silence"] == "1",
