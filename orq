@@ -40,9 +40,12 @@ LOG = HOME / "log.jsonl"
 # ao lado o proibia. Esta e' a versao estrita; confirmar antes da Fase 2.
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_/-]*$")
 
-# Janela que nasce junto com a sessao. Nao e' worktree; e' so um shell pra
-# sessao existir. Prefixo `_` pra nunca colidir com <repo>/<slug>.
-SCRATCH_WINDOW = "_scratch"
+# Janela que nasce junto com a sessao, no `root:` do workspace. Nao e' worktree:
+# e' onde mora o agente de NIVEL DE WORKSPACE — o orquestrador, que trabalha um
+# nivel acima dos repos. Ele precisa nascer de um `spawn` como qualquer outro,
+# senao nao esta no registro e o `done` dos workers nao tem pra quem mandar.
+# Prefixo `_` pra nunca colidir com <repo>/<slug>.
+LEAD_WINDOW = "_lead"
 
 # Shells parados: um pane rodando um destes esta "livre" pro spawn tomar.
 SHELLS = {"bash", "zsh", "fish", "sh", "dash", "ksh"}
@@ -308,6 +311,16 @@ def worktree_path(cfg, repo, slug):
     return root / repo / slug
 
 
+def lead_root(cfg):
+    """Onde nasce o agente de nivel de workspace. Default `~` preserva o
+    comportamento de quem nao declara `root:`."""
+    root = expand(cfg.get("root") or "~")
+    if not root.is_dir():
+        raise OrqError(f"root '{root}' nao existe ou nao e' diretorio "
+                       f"(chave `root:` do workspace)")
+    return root
+
+
 # --- file ops e post_create -------------------------------------------------
 
 def apply_file_ops(cfg, src, dst):
@@ -451,8 +464,8 @@ def cmd_up(args, quiet=False):
     cfg = workspace_config(ws)
     session = cfg.get("session") or ws
     if not session_exists(session):
-        tmux("new-session", "-d", "-s", session, "-n", SCRATCH_WINDOW,
-             "-c", str(expand("~")))
+        tmux("new-session", "-d", "-s", session, "-n", LEAD_WINDOW,
+             "-c", str(lead_root(cfg)))
         # `set-option -t` e' alvo de PANE, entao `=<sessao>` sozinho nao resolve
         # ("no such session"). O `:` final o torna alvo de sessao, e o `=` segue
         # impedindo casar com uma sessao de nome parecido.
@@ -599,18 +612,32 @@ def cmd_spawn(args):
     ws = resolve_ws(args.ws)
     cfg = workspace_config(ws)
     session = cfg.get("session") or ws
-    repo, slug = split_target(args.wt)
-    window = f"{repo}/{slug}"
 
     state = read_state(ws)
     if args.name in (state.get("agents") or {}):
         raise OrqError(f"'{args.name}' ja esta em uso neste workspace")
-    meta = (state.get("worktrees") or {}).get(window)
-    if not meta:
-        raise OrqError(f"worktree '{window}' nao existe — rode `orq wt new` antes")
-    if not window_exists(session, window):
-        raise OrqError(f"a janela '{window}' nao esta viva — rode `orq resurrect`")
-    path = meta["path"]
+
+    criei_janela = False
+    if args.wt:
+        repo, slug = split_target(args.wt)
+        window = f"{repo}/{slug}"
+        meta = (state.get("worktrees") or {}).get(window)
+        if not meta:
+            raise OrqError(f"worktree '{window}' nao existe — rode `orq wt new` antes")
+        if not window_exists(session, window):
+            raise OrqError(f"a janela '{window}' nao esta viva — rode `orq resurrect`")
+        path = meta["path"]
+    else:
+        # Sem --wt o agente e' de nivel de workspace: nasce no `root:`, na
+        # janela _lead. A janela e' recriada se sumiu, porque `resurrect` so
+        # cuida de worktree e a sessao pode ter perdido so esta.
+        if not session_exists(session):
+            raise OrqError(f"sessao '{session}' nao existe — rode `orq up {ws}`")
+        window = LEAD_WINDOW
+        path = str(lead_root(cfg))
+        if not window_exists(session, window):
+            tmux("new-window", "-d", "-t", f"={session}", "-n", window, "-c", path)
+            criei_janela = True
 
     session_id = str(uuid.uuid4())
     if args.cmd_str:
@@ -636,10 +663,18 @@ def cmd_spawn(args):
     registrados = {a["pane"] for a in (state.get("agents") or {}).values()}
     livres = [p for p in panes if p["pane"] not in registrados
               and p["command"] in SHELLS]
-    tomar = (not args.split) and len(panes) == 1 and len(livres) == 1
+    # Janela que o proprio spawn acabou de criar tem um pane so, novo e de
+    # ninguem — nao precisa da heuristica de shell parado, e nao pode usa-la:
+    # por ~50ms depois do `new-window` o tmux ainda reporta `tmux` como
+    # pane_current_command, entao o pane nao casaria com SHELLS e o spawn
+    # dividiria a janela deixando um bash orfao ao lado.
+    tomar = (not args.split) and (
+        criei_janela or (len(panes) == 1 and len(livres) == 1))
 
     if tomar:
-        pane = livres[0]["pane"]
+        # Na janela recem-criada o unico pane e' o nosso e `livres` esta vazio
+        # pela mesma corrida de pane_current_command — entao pega de `panes`.
+        pane = (panes if criei_janela else livres)[0]["pane"]
         tmux("send-keys", "-t", pane, "-l", launch)
         tmux("send-keys", "-t", pane, "Enter")
     else:
@@ -653,13 +688,15 @@ def cmd_spawn(args):
 
     def mutate(st):
         st.setdefault("agents", {})[args.name] = {
-            "pane": pane, "wt": window, "provider": provider,
+            "pane": pane, "wt": window if args.wt else None,
+            "window": window, "provider": provider,
             "cmd": args.cmd_str, "session_id": session_id if provider else None,
             "parent": parent, "path": path,
             "created_at": datetime.now(timezone.utc).astimezone().isoformat(),
         }
     update_state(ws, mutate)
-    log_event(cmd="spawn", ws=ws, wt=window, name=args.name, pane=pane,
+    log_event(cmd="spawn", ws=ws, wt=window if args.wt else None,
+              window=window, name=args.name, pane=pane,
               provider=provider, cmd_str=args.cmd_str,
               session_id=session_id if provider else None, parent=parent,
               took_existing=tomar, ok=True)
@@ -825,6 +862,13 @@ def cmd_resurrect(args):
         print(f"  recriada  {ws}:{window}  [{meta.get('branch') or '?'}]{marca}")
 
 
+def fmt_pane(p):
+    nome = p["name"] or "-"
+    pai = f" <- {p['parent']}" if p["parent"] else ""
+    sil = " zzz" if p["silence"] else ""
+    return f"    {p['pane']}  {nome}  {p['command']}{pai}{sil}"
+
+
 def cmd_ls(args):
     workspaces = [args.ws] if args.ws else sorted(
         p.stem for p in WORKSPACES.glob("*.yml")
@@ -853,8 +897,6 @@ def cmd_ls(args):
                 agentes = {n: a for n, a in agentes.items() if n not in mortos}
         janelas = {}
         for p in panes:
-            if p["window"] == SCRATCH_WINDOW:
-                continue
             reg = next((dict(a, name=n) for n, a in agentes.items()
                         if a.get("pane") == p["pane"]), None)
             janelas.setdefault(p["window"], []).append({
@@ -867,6 +909,10 @@ def cmd_ls(args):
                 # construir deteccao de ociosidade (que foi cortada).
                 "silence": p["silence"] == "1",
             })
+        # Fora antes do laco de worktrees: _lead nao e' worktree, e sem tirar
+        # daqui ele cairia no balde de "janela sem registro" e seria anunciado
+        # como worktree desconhecido.
+        lead = janelas.pop(LEAD_WINDOW, [])
         wts = []
         for window, meta in sorted(state.get("worktrees", {}).items()):
             path = Path(meta["path"])
@@ -891,6 +937,11 @@ def cmd_ls(args):
                      # comando novo.
                      "repos": {k: str(expand(v))
                                for k, v in (cfg.get("repos") or {}).items()},
+                     # o `root:` sai cru, sem validar: `ls` e' leitura, quem
+                     # recusa root inexistente e' o `up` e o `spawn`.
+                     "lead": {"window": LEAD_WINDOW,
+                              "root": str(expand(cfg.get("root") or "~")),
+                              "panes": lead},
                      "worktrees": wts})
 
     if args.json:
@@ -904,6 +955,10 @@ def cmd_ls(args):
         print(f"{ws['workspace']}{marca}")
         if ws["repos"]:
             print(f"  repos: {', '.join(sorted(ws['repos']))}")
+        if ws["lead"]["panes"]:
+            print(f"  {ws['lead']['window']}  ({ws['lead']['root']})")
+            for p in ws["lead"]["panes"]:
+                print(fmt_pane(p))
         for wt in ws["worktrees"]:
             sujo = " *" if wt["dirty"] else ""
             avisos = []
@@ -915,10 +970,7 @@ def cmd_ls(args):
             aviso = f"  ({'; '.join(avisos)})" if avisos else ""
             print(f"  {wt['worktree']}  [{wt['branch'] or '?'}]{sujo}{aviso}")
             for p in wt["panes"]:
-                nome = p["name"] or "-"
-                pai = f" <- {p['parent']}" if p["parent"] else ""
-                sil = " zzz" if p["silence"] else ""
-                print(f"    {p['pane']}  {nome}  {p['command']}{pai}{sil}")
+                print(fmt_pane(p))
 
 
 def cmd_log(args):
@@ -982,8 +1034,10 @@ def build_parser():
     sp.add_argument("--ws")
     sp.set_defaults(func=cmd_resurrect)
 
-    sp = sub.add_parser("spawn", help="sobe um terminal/agente num worktree")
-    sp.add_argument("name"); sp.add_argument("--wt", required=True)
+    sp = sub.add_parser("spawn",
+                        help="sobe um terminal/agente num worktree; sem --wt "
+                             "nasce no root do workspace (janela _lead)")
+    sp.add_argument("name"); sp.add_argument("--wt")
     sp.add_argument("--provider"); sp.add_argument("--cmd", dest="cmd_str")
     sp.add_argument("--prompt"); sp.add_argument("--parent")
     sp.add_argument("--split", action="store_true"); sp.add_argument("--ws")
