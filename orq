@@ -1332,7 +1332,9 @@ def cmd_schedule_add(args):
     print(f"  comando: {cmd}")
 
 
-def cmd_schedule_ls(args):
+def schedule_rows(ws=None):
+    """Linhas de schedule, lidas do systemd. Compartilhado pelo `schedule ls`
+    e pelo `ls` -- o plano quer schedule e workspace na MESMA dashboard."""
     linhas = []
     for nome in sched_units():
         unidade = f"{SCHED_PREFIX}{nome}"
@@ -1346,9 +1348,30 @@ def cmd_schedule_ls(args):
             "state": d.get("ActiveState"),
             "next": d.get("NextElapseUSecRealtime") or None,
             "last": d.get("LastTriggerUSec") or None,
-            "ws": meta.get("ws"), "criador": meta.get("criador"),
+            # `-` e' o marcador de vazio na unidade (texto); no JSON vira null
+            "ws": (meta.get("ws") or None) if meta.get("ws") != "-" else None,
+            "criador": meta.get("criador"),
             "calendario": meta.get("calendario"), "exec": meta.get("exec"),
         })
+    if ws:
+        linhas = [l for l in linhas if l["ws"] == ws]
+    return linhas
+
+
+def fmt_schedule(s_, indent="  "):
+    marca = "" if s_["state"] == "active" else f"  ({s_['state']})"
+    out = [f"{s_['name']}{marca}",
+           f"{indent}quando: {s_['calendario'] or '?'}",
+           f"{indent}proxima: {s_['next'] or '-'}"]
+    if s_["last"]:
+        out.append(f"{indent}ultima: {s_['last']}")
+    out.append(f"{indent}criador: {s_['criador'] or '?'}   ws: {s_['ws'] or '-'}")
+    out.append(f"{indent}exec: {s_['exec'] or '?'}")
+    return "\n".join(out)
+
+
+def cmd_schedule_ls(args):
+    linhas = schedule_rows()
     if args.json:
         print(json.dumps(linhas, indent=2, ensure_ascii=False))
         return
@@ -1356,14 +1379,7 @@ def cmd_schedule_ls(args):
         print("nenhum schedule")
         return
     for s_ in linhas:
-        marca = "" if s_["state"] == "active" else f"  ({s_['state']})"
-        print(f"{s_['name']}{marca}")
-        print(f"  quando: {s_['calendario'] or '?'}")
-        print(f"  proxima: {s_['next'] or '-'}")
-        if s_["last"]:
-            print(f"  ultima: {s_['last']}")
-        print(f"  criador: {s_['criador'] or '?'}   ws: {s_['ws'] or '-'}")
-        print(f"  exec: {s_['exec'] or '?'}")
+        print(fmt_schedule(s_))
 
 
 def cmd_schedule_rm(args):
@@ -1473,10 +1489,19 @@ def cmd_ls(args):
                               "panes": lead},
                      "worktrees": wts})
 
+    # Schedules entram na MESMA saida dos workspaces: e' a dashboard unica que
+    # o plano pede, e o contrato "nada de estado so dentro da CLI" vale pra
+    # eles tambem. Filtrados pelo workspace quando um foi pedido.
+    scheds = schedule_rows(ws=_ws)
+
     if args.json:
-        print(json.dumps(tree, indent=2, ensure_ascii=False))
+        # ⚠️ Mudanca de forma: o topo era uma LISTA de workspaces e passa a ser
+        # um objeto com `workspaces` e `schedules`. Feito agora porque a TUI da
+        # Fase 5 ainda nao existe pra quebrar.
+        print(json.dumps({"workspaces": tree, "schedules": scheds},
+                         indent=2, ensure_ascii=False))
         return
-    if not tree:
+    if not tree and not scheds:
         print("nenhum workspace em " + str(WORKSPACES))
         return
     for ws in tree:
@@ -1500,6 +1525,11 @@ def cmd_ls(args):
             print(f"  {wt['worktree']}  [{wt['branch'] or '?'}]{sujo}{aviso}")
             for p in wt["panes"]:
                 print(fmt_pane(p))
+
+    if scheds:
+        print("schedules")
+        for s_ in scheds:
+            print("  " + fmt_schedule(s_, indent="  ").replace("\n", "\n  "))
 
 
 def cmd_log(args):
