@@ -571,9 +571,13 @@ def wait_for_ready(pane, binario, ready_when, blocked_when):
     limite = time.monotonic() + BOOT_TIMEOUT_S
     tela = ""
     while time.monotonic() < limite:
-        p = tmux("display-message", "-p", "-t", pane, "#{pane_current_command}",
-                 check=False)
-        vivo = p.returncode == 0 and p.stdout.strip() == binario
+        # Arvore de processos, nao `pane_current_command`: em pane nascido de
+        # split-window o tmux reporta o shell, entao esta porta NUNCA abria e
+        # `spawn --split --prompt` estourava os 30s sem sequer olhar a tela.
+        # Mesma causa que furava a recusa do `wt rm` e mentia no `ls`.
+        p = tmux("display-message", "-p", "-t", pane, "#{pane_pid}", check=False)
+        vivo = (p.returncode == 0
+                and binario in pane_procs(p.stdout.strip()))
         if vivo:
             c = tmux("capture-pane", "-p", "-t", pane, check=False)
             tela = c.stdout if c.returncode == 0 else ""
