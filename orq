@@ -36,15 +36,22 @@ STATE = HOME / "state"
 LOG = HOME / "log.jsonl"
 HOOKS = HOME / "hooks"
 
-# Evento do agente -> status no registro. UM comando serve os tres: o payload
-# do hook traz `hook_event_name`, entao a tabela mora aqui em vez de virar tres
+# Evento do agente -> status no registro. UM comando serve todos: o payload do
+# hook traz `hook_event_name`, entao a tabela mora aqui em vez de virar varias
 # entradas diferentes no settings do provider.
-# ⚠️ `waiting` nao e' universal entre providers; a coluna admite ausencia em vez
-# de fingir (o orq so implementa Claude Code na v1).
+#
+# ❌ `waiting` foi CORTADO em 01/09/2026, depois de medido. O `Notification` do
+# Claude Code dispara 60s DEPOIS do Stop, com message="Claude is waiting for
+# your input" -- ou seja, `waiting` era `done` mais um minuto, sem nenhuma
+# informacao nova sobre o agente. Pior: sobrescrevia o `done`, e a partir dai o
+# `ls` nao distinguia mais quem TERMINOU de quem foi spawnado e nunca produziu
+# nada. No workmux `waiting` significa "precisa do humano" (pergunta ou
+# permissao pendente); com --dangerously-skip-permissions esse caso nao existe
+# aqui, entao o estado degenerou em cronometro. Dois estados que o agente
+# realmente distingue valem mais que tres em que um mente.
 HOOK_STATUS = {
     "UserPromptSubmit": "working",
     "Stop": "done",
-    "Notification": "waiting",
 }
 # schedules NAO moram aqui: a unidade systemd e' a unica fonte de verdade.
 
