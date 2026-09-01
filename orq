@@ -36,6 +36,16 @@ STATE = HOME / "state"
 LOG = HOME / "log.jsonl"
 HOOKS = HOME / "hooks"
 
+# Schedules: a UNIDADE e' o registro. Nao ha espelho em ~/.orq/ pra divergir --
+# a unidade se autodescreve e o `schedule ls` le o systemd direto.
+UNITS = Path(os.environ.get("ORQ_UNITS",
+                            Path.home() / ".config/systemd/user"))
+SCHED_PREFIX = "orq-"
+# Teto de quantidade: agente criando job recorrente e' poder de outra natureza
+# -- roda depois, sozinho, com bypass, sem ninguem olhando, e pode criar
+# outros. O caso feio nao e' malicia, e' ACUMULO.
+SCHED_MAX = 32
+
 # Evento do agente -> status no registro. UM comando serve todos: o payload do
 # hook traz `hook_event_name`, entao a tabela mora aqui em vez de virar varias
 # entradas diferentes no settings do provider.
@@ -579,6 +589,107 @@ def wait_for_ready(pane, binario, ready_when, blocked_when):
 
 
 # --- comandos ---------------------------------------------------------------
+
+# --- schedules: systemd --user ----------------------------------------------
+
+def systemctl(*a, check=True):
+    return run(["systemctl", "--user", *a], check=check)
+
+
+def orq_timezone():
+    """Fuso a escrever nas unidades. NUNCA se omite: quando um agente pede
+    "todo dia as 19h" ele quer dizer 19h DO USER, e nao tem como saber em que
+    fuso a caixa esta. A regra vale mesmo com a maquina no fuso certo -- em
+    31/08 a asimov estava em Etc/UTC e um `19:03` cru dispararia 16:03."""
+    cfg = load_yaml(CONFIG, "config.yml") if CONFIG.exists() else {}
+    tz = (cfg or {}).get("timezone")
+    if tz:
+        return tz
+    r = run(["timedatectl", "show", "-p", "Timezone", "--value"], check=False)
+    return r.stdout.strip() or "UTC"
+
+
+def _tok(tok):
+    """Campo de cron -> campo de calendario systemd."""
+    if tok == "*":
+        return "*"
+    t = tok.replace("-", "..")
+    if t.startswith("*/"):
+        t = "0/" + t[2:]
+    return ",".join(x.zfill(2) if x.isdigit() else x for x in t.split(","))
+
+
+def _dow(tok):
+    if tok == "*":
+        return ""
+    nomes = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    def um(x):
+        return nomes[int(x)] if x.isdigit() and int(x) <= 7 else x
+    partes = []
+    for parte in tok.split(","):
+        if "-" in parte:
+            a, b = parte.split("-", 1)
+            partes.append(f"{um(a)}..{um(b)}")
+        else:
+            partes.append(um(parte))
+    return ",".join(partes) + " "
+
+
+def cron_to_calendar(expr, tz):
+    campos = expr.split()
+    if len(campos) != 5:
+        raise OrqError(
+            f"cron precisa de 5 campos (min hora dia mes dia-da-semana), "
+            f"veio {len(campos)}: '{expr}'"
+        )
+    m, h, dom, mon, dow = campos
+    return (f"{_dow(dow)}*-{_tok(mon)}-{_tok(dom)} "
+            f"{_tok(h)}:{_tok(m)}:00 {tz}")
+
+
+def calendar_next(calendario):
+    """`systemd-analyze calendar` e' o validador de graca: valida a expressao
+    E imprime a proxima execucao, entao nao ha parser de cron escrito a mao
+    pra confiar."""
+    r = run(["systemd-analyze", "calendar", calendario], check=False)
+    if r.returncode != 0:
+        detalhe = (r.stderr or r.stdout or "").strip().splitlines()
+        raise OrqError(f"calendario invalido '{calendario}': "
+                       f"{detalhe[0] if detalhe else 'recusado pelo systemd'}")
+    for linha in r.stdout.splitlines():
+        if "Next elapse:" in linha:
+            return linha.split("Next elapse:", 1)[1].strip()
+    return "?"
+
+
+def sched_units():
+    """O que o SYSTEMD conhece, nao o que ha no disco."""
+    r = systemctl("list-unit-files", f"{SCHED_PREFIX}*.timer",
+                  "--no-legend", "--plain", check=False)
+    nomes = []
+    for linha in r.stdout.splitlines():
+        campos = linha.split()
+        if campos and campos[0].endswith(".timer"):
+            nomes.append(campos[0][len(SCHED_PREFIX):-len(".timer")])
+    return sorted(nomes)
+
+
+def sched_meta(nome):
+    """Metadados vem das linhas `# orq:` da propria unidade -- e' isto que faz
+    a unidade se autodescrever e dispensa um espelho pra divergir."""
+    r = systemctl("cat", f"{SCHED_PREFIX}{nome}.service", check=False)
+    meta, execstart = {}, None
+    for linha in r.stdout.splitlines():
+        if linha.startswith("# orq:"):
+            for par in linha[len("# orq:"):].strip().split("  "):
+                if "=" in par:
+                    k, v = par.split("=", 1)
+                    meta[k.strip()] = v.strip()
+        elif linha.startswith("ExecStart="):
+            execstart = linha[len("ExecStart="):]
+    meta["exec"] = execstart
+    return meta
+
 
 def cmd_up(args, quiet=False):
     ws = resolve_ws(ws_arg(args))
@@ -1144,6 +1255,138 @@ def fmt_pane(p):
     return f"    {p['pane']}  {nome}  {p['command']}{pai}{st}{sil}"
 
 
+def cmd_schedule_add(args):
+    if not NAME_RE.match(args.name):
+        raise OrqError(f"nome invalido: '{args.name}' (esperado {NAME_RE.pattern})")
+    if "/" in args.name:
+        raise OrqError("nome de schedule nao aceita `/` (vira nome de unidade)")
+    if not args.command:
+        raise OrqError("falta o comando: `orq schedule add <nome> --cron '…' -- <comando>`")
+    if bool(args.cron) == bool(args.calendar):
+        raise OrqError("passe --cron OU --calendar, nao os dois nem nenhum")
+
+    existentes = sched_units()
+    if args.name in existentes:
+        raise OrqError(f"schedule '{args.name}' ja existe — `orq schedule rm` antes")
+    if len(existentes) >= SCHED_MAX:
+        raise OrqError(f"teto de {SCHED_MAX} schedules atingido ({len(existentes)} ativos). "
+                       f"remova algum antes — acumulo silencioso e' o risco real aqui")
+
+    tz = orq_timezone()
+    calendario = args.calendar or cron_to_calendar(args.cron, tz)
+    proxima = calendar_next(calendario)          # valida antes de escrever
+
+    # shlex.join, nao " ".join: o shell do usuario ja tirou as aspas, entao
+    # juntar com espaco quebra qualquer argumento que tinha espaco dentro --
+    # `claude -p "prompt longo"` viraria varios argumentos. shlex.join
+    # reconstroi uma linha de shell equivalente ao argv original.
+    cmd = shlex.join(args.command)
+    ws = ws_arg(args)
+    criador = caller_agent() or "humano"
+    agora = datetime.now(timezone.utc).astimezone().isoformat()
+    wd = str(lead_root(workspace_config(ws))) if ws else str(expand("~"))
+
+    UNITS.mkdir(parents=True, exist_ok=True)
+    unidade = f"{SCHED_PREFIX}{args.name}"
+    # As linhas `# orq:` sao o registro. Nao ha copia em ~/.orq/ pra divergir.
+    (UNITS / f"{unidade}.service").write_text(
+        f"[Unit]\n"
+        f"Description=orq schedule: {args.name}\n"
+        f"# orq: nome={args.name}  ws={ws or '-'}  criador={criador}  em={agora}\n"
+        f"# orq: calendario={calendario}\n"
+        f"\n[Service]\n"
+        f"Type=oneshot\n"
+        f"WorkingDirectory={wd}\n"
+        # Duas armadilhas do ExecStart, ambas silenciosas:
+        # 1. NAO roda shell -- aspas, pipe e redirecionamento morreriam. Dai o
+        #    wrap em `bash -lc`, mesma familia do wrap do `--cmd`.
+        # 2. `%` e' ESPECIFICADOR do systemd e e' expandido antes do bash ver.
+        #    Medido: `$(date +%T)` virou `$(date +/tmp)` porque %T e' o
+        #    diretorio temporario. Dobrar e' o escape.
+        f"ExecStart=/bin/bash -lc "
+        f"{shlex.quote(cmd).replace('%', '%%')}\n"
+    )
+    (UNITS / f"{unidade}.timer").write_text(
+        f"[Unit]\n"
+        f"Description=orq schedule: {args.name}\n"
+        f"\n[Timer]\n"
+        f"OnCalendar={calendario}\n"
+        f"Persistent=true\n"
+        f"\n[Install]\n"
+        f"WantedBy=timers.target\n"
+    )
+    systemctl("daemon-reload")
+    systemctl("enable", "--now", f"{unidade}.timer")
+
+    # Write-through: loga DEPOIS que o systemd confirmou, pra o log nunca
+    # afirmar algo que nao existe.
+    log_event(cmd="schedule add", name=args.name, ws=ws, criador=criador,
+              calendario=calendario, comando=cmd, next=proxima, ok=True)
+    print(f"{args.name}  ->  {unidade}.timer")
+    print(f"  quando: {calendario}")
+    print(f"  proxima execucao: {proxima}")
+    print(f"  comando: {cmd}")
+
+
+def cmd_schedule_ls(args):
+    linhas = []
+    for nome in sched_units():
+        unidade = f"{SCHED_PREFIX}{nome}"
+        props = systemctl("show", f"{unidade}.timer", "--property=NextElapseUSecRealtime",
+                          "--property=LastTriggerUSec", "--property=ActiveState",
+                          check=False).stdout
+        d = dict(l.split("=", 1) for l in props.splitlines() if "=" in l)
+        meta = sched_meta(nome)
+        linhas.append({
+            "name": nome, "unit": f"{unidade}.timer",
+            "state": d.get("ActiveState"),
+            "next": d.get("NextElapseUSecRealtime") or None,
+            "last": d.get("LastTriggerUSec") or None,
+            "ws": meta.get("ws"), "criador": meta.get("criador"),
+            "calendario": meta.get("calendario"), "exec": meta.get("exec"),
+        })
+    if args.json:
+        print(json.dumps(linhas, indent=2, ensure_ascii=False))
+        return
+    if not linhas:
+        print("nenhum schedule")
+        return
+    for s_ in linhas:
+        marca = "" if s_["state"] == "active" else f"  ({s_['state']})"
+        print(f"{s_['name']}{marca}")
+        print(f"  quando: {s_['calendario'] or '?'}")
+        print(f"  proxima: {s_['next'] or '-'}")
+        if s_["last"]:
+            print(f"  ultima: {s_['last']}")
+        print(f"  criador: {s_['criador'] or '?'}   ws: {s_['ws'] or '-'}")
+        print(f"  exec: {s_['exec'] or '?'}")
+
+
+def cmd_schedule_rm(args):
+    if args.name not in sched_units():
+        raise OrqError(f"schedule '{args.name}' nao existe")
+    unidade = f"{SCHED_PREFIX}{args.name}"
+    systemctl("disable", "--now", f"{unidade}.timer", check=False)
+    for sufixo in (".timer", ".service"):
+        alvo = UNITS / f"{unidade}{sufixo}"
+        if alvo.exists():
+            alvo.unlink()
+    systemctl("daemon-reload")
+    log_event(cmd="schedule rm", name=args.name,
+              criador=caller_agent() or "humano", ok=True)
+    print(f"{args.name} removido")
+
+
+def cmd_schedule_run(args):
+    if args.name not in sched_units():
+        raise OrqError(f"schedule '{args.name}' nao existe")
+    unidade = f"{SCHED_PREFIX}{args.name}"
+    systemctl("start", f"{unidade}.service")
+    log_event(cmd="schedule run", name=args.name,
+              criador=caller_agent() or "humano", ok=True)
+    print(f"{args.name} disparado agora (fora da agenda)")
+
+
 def cmd_ls(args):
     _ws = ws_arg(args)
     workspaces = [_ws] if _ws else sorted(
@@ -1277,12 +1520,6 @@ def cmd_log(args):
             print(json.dumps(ev, ensure_ascii=False))
 
 
-def todo(name):
-    def _(args):
-        raise OrqError(f"`{name}` ainda nao implementado")
-    return _
-
-
 # --- parser -----------------------------------------------------------------
 
 def build_parser():
@@ -1381,20 +1618,34 @@ def build_parser():
     sc = sp.add_subparsers(dest="schedule_cmd", required=True)
     add = sc.add_parser("add"); add.add_argument("name")
     add.add_argument("--cron"); add.add_argument("--calendar"); add.add_argument("--ws")
-    add.add_argument("command", nargs=argparse.REMAINDER)
-    add.set_defaults(func=todo("schedule add"))
-    sls = sc.add_parser("ls"); sls.add_argument("--json")
-    sls.set_defaults(func=todo("schedule ls"))
+    # O comando vem depois de `--` e e' separado ANTES do argparse (ver main).
+    # Com nargs=REMAINDER aqui, argparse engolia as proprias flags: um
+    # `add <nome> --cron "…"` virava command=["--cron", "…"] e o --cron nunca
+    # era parseado.
+    add.add_argument("command", nargs="*", default=[])
+    add.set_defaults(func=cmd_schedule_add)
+    sls = sc.add_parser("ls"); sls.add_argument("--json", action="store_true")
+    sls.set_defaults(func=cmd_schedule_ls)
     srm = sc.add_parser("rm"); srm.add_argument("name")
-    srm.set_defaults(func=todo("schedule rm"))
-    srun = sc.add_parser("run"); srun.add_argument("name")
-    srun.set_defaults(func=todo("schedule run"))
+    srm.set_defaults(func=cmd_schedule_rm)
+    srun = sc.add_parser("run", help="dispara agora, sem esperar a agenda")
+    srun.add_argument("name")
+    srun.set_defaults(func=cmd_schedule_run)
 
     return p
 
 
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # `--` separa o comando do usuario dos argumentos do orq. Fica fora do
+    # argparse de proposito: dentro dele, REMAINDER engole flag.
+    resto = None
+    if "--" in argv:
+        corte = argv.index("--")
+        argv, resto = argv[:corte], argv[corte + 1:]
     args = build_parser().parse_args(argv)
+    if resto is not None:
+        args.command = resto
     try:
         args.func(args)
     except OrqError as e:
