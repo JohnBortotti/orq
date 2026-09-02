@@ -1,0 +1,444 @@
+#!/home/joao/workspace/orq/.venv/bin/python
+"""orq-dash -- a Textual dashboard over `orq`.
+
+A SEPARATE program on purpose. It talks to orq only through the CLI contract
+(`orq ls --json`, `orq schedule ls --json`, `orq read`), so it knows nothing
+about tmux, systemd or the registry. If this breaks, the orchestrator does
+not: `orq` itself stays single-file, stdlib plus PyYAML, and never imports
+anything from here.
+
+Where the line sits: the dashboard operates on ORQ OBJECTS -- panes,
+worktrees, schedules. Selecting a row and acting on it is less friction than
+typing the target's name into a shell. It never becomes a chat client: there
+is no box for talking to an agent, because the agent's real interface is its
+pane, with its own autocomplete, file references and modes. A textarea that
+pastes text loses all of that and duplicates the conversation surface.
+
+Destructive actions always confirm, and `--force` is deliberately absent --
+the refusals in `orq wt rm` are the safety net, and a shortcut that skips them
+would undo it.
+"""
+
+import json
+import subprocess
+from datetime import datetime, timezone
+
+from textual import work
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical
+from textual.reactive import reactive
+from textual.screen import ModalScreen
+from textual.widgets import (DataTable, Footer, Header, Input, Label, Static)
+
+REFRESH_S = 2.0
+PREVIEW_LINES = 60
+
+
+# --- talking to orq ----------------------------------------------------------
+
+def orq(*args, timeout=10):
+    """Every call to orq goes through here. Never raises: a dashboard that
+    crashes because a subcommand failed is worse than one showing stale rows."""
+    try:
+        p = subprocess.run(["orq", *args], capture_output=True, text=True,
+                           timeout=timeout)
+        return p.returncode, p.stdout, p.stderr.strip()
+    except (OSError, subprocess.SubprocessError) as e:
+        return 1, "", str(e)
+
+
+def orq_json(*args):
+    code, out, err = orq(*args)
+    if code != 0:
+        return None, err
+    try:
+        return json.loads(out or "null"), None
+    except json.JSONDecodeError as e:
+        return None, f"invalid JSON from orq: {e}"
+
+
+def age_since(iso):
+    """'12m', '3h', '2d' -- how a stuck agent becomes visible."""
+    if not iso:
+        return ""
+    try:
+        delta = datetime.now(timezone.utc) - datetime.fromisoformat(iso).astimezone(timezone.utc)
+    except ValueError:
+        return ""
+    secs = int(delta.total_seconds())
+    if secs < 60:
+        return f"{secs}s"
+    if secs < 3600:
+        return f"{secs // 60}m"
+    if secs < 86400:
+        return f"{secs // 3600}h"
+    return f"{secs // 86400}d"
+
+
+def when_short(ts):
+    """`Wed 2026-09-02 08:03:00 -03` -> `wed 08:03`, `today 19:03` when today."""
+    if not ts or ts == "-":
+        return "-"
+    try:
+        d = datetime.strptime(" ".join(ts.split()[:3]), "%a %Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return ts[:16]
+    days = (d.date() - datetime.now().date()).days
+    label = {0: "today", 1: "tomorrow"}.get(
+        days, ["mon", "tue", "wed", "thu", "fri", "sat", "sun"][d.weekday()])
+    return f"{label} {d:%H:%M}"
+
+
+def sched_cmd(execstart):
+    """`/bin/bash -lc 'cmd'` -> `cmd`."""
+    if not execstart:
+        return ""
+    import shlex
+    try:
+        parts = shlex.split(execstart)
+    except ValueError:
+        return execstart
+    return parts[-1] if parts else execstart
+
+
+# --- rows --------------------------------------------------------------------
+
+class Row:
+    """One line in the table, plus everything an action needs to run without
+    the user typing a name."""
+
+    def __init__(self, kind, cells, *, agent=None, worktree=None, schedule=None,
+                 ws=None, target=None, status=None):
+        self.kind = kind          # "pane" | "worktree" | "schedule"
+        self.cells = cells
+        self.agent = agent
+        self.worktree = worktree
+        self.schedule = schedule
+        self.ws = ws
+        self.target = target      # session:window.pane, for switch-client
+        self.status = status
+
+    @property
+    def label(self):
+        return self.agent or self.worktree or self.schedule or "?"
+
+
+def collect(ws_filter=None):
+    """Builds every row from the CLI contract. Returns (rows, error)."""
+    args = ["ls", "--json"] + (["--ws", ws_filter] if ws_filter else [])
+    data, err = orq_json(*args)
+    if err:
+        return [], err
+    rows = []
+    for w in (data or {}).get("workspaces", []):
+        session = w["session"]
+        alive = w["session_alive"]
+        groups = [(w["lead"]["window"], None, w["lead"]["panes"], w["lead"]["root"], None)]
+        for wt in w["worktrees"]:
+            notes = []
+            if wt["exists"] is False:
+                notes.append("path gone")
+            elif not wt["window_alive"]:
+                notes.append("no window")
+            if wt["dirty"]:
+                notes.append("dirty")
+            groups.append((wt["worktree"], wt["branch"], wt["panes"],
+                           " · ".join(notes), wt["worktree"]))
+        for window, branch, panes, note, wt_name in groups:
+            rows.append(Row(
+                "worktree",
+                [f"[b]{window}[/b]", f"[dim]{branch or ''}[/dim]", "", "",
+                 f"[yellow]{note or ''}[/yellow]"],
+                worktree=wt_name, ws=w["workspace"]))
+            for p in panes:
+                st = p.get("status") or ""
+                color = {"working": "yellow", "done": "green"}.get(st, "dim")
+                rows.append(Row(
+                    "pane",
+                    [f"  {'●' if p['name'] else '○'} {p['name'] or '-'}",
+                     p["command"],
+                     f"[{color}]{st}[/{color}]",
+                     age_since(p.get("status_at")),
+                     f"[dim]{p['parent'] + ' ←' if p.get('parent') else ''} {p['pane']}[/dim]"],
+                    agent=p["name"], ws=w["workspace"],
+                    target=f"{session}:{window}.{p['pane']}" if alive else None,
+                    status=st))
+
+    scheds, serr = orq_json("schedule", "ls", "--json")
+    for s in (scheds or []):
+        rows.append(Row(
+            "schedule",
+            [f"  ⏱ {s['name']}", when_short(s.get("next")), "", "",
+             f"[dim]{(s.get('desc') or sched_cmd(s.get('exec')))[:60]}[/dim]"],
+            schedule=s["name"]))
+    return rows, serr
+
+
+# --- confirmation ------------------------------------------------------------
+
+class Confirm(ModalScreen[bool]):
+    """Every destructive action goes through here. There is no --force path:
+    the refusals inside `orq wt rm` are the safety net, and a shortcut that
+    skipped them would undo the work that built them."""
+
+    BINDINGS = [Binding("escape", "dismiss(False)", "cancel"),
+                Binding("y", "yes", "confirm")]
+
+    def __init__(self, question):
+        super().__init__()
+        self.question = question
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm-box"):
+            yield Label(self.question, id="confirm-text")
+            yield Label("[dim]y to confirm · esc to cancel[/dim]")
+
+    def action_yes(self):
+        self.dismiss(True)
+
+
+# --- the app -----------------------------------------------------------------
+
+class OrqDash(App):
+    CSS = """
+    Screen { layout: vertical; }
+    #body { height: 1fr; }
+    #left { width: 3fr; }
+    #right { width: 2fr; border-left: solid $panel; }
+    #preview { padding: 0 1; }
+    #preview-title { background: $panel; padding: 0 1; }
+    #filter { display: none; dock: bottom; }
+    #filter.on { display: block; }
+    #status { dock: bottom; height: 1; padding: 0 1; color: $text-muted; }
+    #confirm-box {
+        width: 60; height: auto; padding: 1 2;
+        background: $surface; border: thick $warning; align: center middle;
+    }
+    Confirm { align: center middle; }
+    DataTable { height: 1fr; }
+    """
+
+    BINDINGS = [
+        Binding("q", "quit", "quit"),
+        Binding("enter", "switch", "open pane"),
+        Binding("k", "kill", "kill agent"),
+        Binding("d", "wt_rm", "rm worktree"),
+        Binding("x", "sched_rm", "rm schedule"),
+        Binding("f", "sched_run", "fire schedule"),
+        Binding("R", "resurrect", "resurrect"),
+        Binding("slash", "filter", "filter"),
+        Binding("escape", "clear_filter", "clear filter", show=False),
+        Binding("r", "refresh", "refresh"),
+    ]
+
+    filter_text = reactive("")
+
+    def __init__(self, ws=None):
+        super().__init__()
+        self.ws = ws
+        self.rows: list[Row] = []
+        self.err = None
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        with Horizontal(id="body"):
+            with Vertical(id="left"):
+                yield DataTable(id="table", cursor_type="row", zebra_stripes=False)
+            with Vertical(id="right"):
+                yield Label("preview", id="preview-title")
+                yield Static("", id="preview")
+        yield Input(placeholder="filter…", id="filter")
+        yield Static("", id="status")
+        yield Footer()
+
+    def on_mount(self):
+        self.title = "orq"
+        self.sub_title = self.ws or "all workspaces"
+        t = self.query_one("#table", DataTable)
+        for col, width in (("name", 26), ("process", 12), ("state", 9),
+                           ("age", 6), ("detail", 40)):
+            t.add_column(col, width=width)
+        # Without this the arrow keys never reach the table and nothing moves.
+        t.focus()
+        self.first_load = True
+        self.set_interval(REFRESH_S, self.reload)
+        self.reload()
+
+    # --- data ---
+
+    @work(thread=True, exclusive=True)
+    def reload(self):
+        rows, err = collect(self.ws)
+        self.call_from_thread(self.apply, rows, err)
+
+    def apply(self, rows, err):
+        self.rows, self.err = rows, err
+        t = self.query_one("#table", DataTable)
+        keep = t.cursor_row
+        t.clear()
+        # NOT `self.visible`: DOMNode already owns that name, with a setter
+        # that validates against a set of visibility values.
+        self.shown: list[Row] = []
+        needle = self.filter_text.lower()
+        for r in rows:
+            if needle and needle not in r.label.lower():
+                continue
+            self.shown.append(r)
+            t.add_row(*r.cells)
+        if t.row_count:
+            if getattr(self, "first_load", False):
+                # Land on the first agent, not on a worktree header: the
+                # preview is the point, and it should be populated on arrival.
+                first = next((i for i, r in enumerate(self.shown)
+                              if r.kind == "pane" and r.agent), 0)
+                t.move_cursor(row=first)
+                self.first_load = False
+            else:
+                t.move_cursor(row=min(keep, t.row_count - 1))
+        self.set_status(err and f"[red]{err}[/red]" or self.counts())
+        self.refresh_preview()
+
+    def counts(self):
+        panes = [r for r in self.rows if r.kind == "pane"]
+        working = sum(1 for r in panes if r.status == "working")
+        scheds = sum(1 for r in self.rows if r.kind == "schedule")
+        shown = f" · showing {len(self.shown)}/{len(self.rows)}" if self.filter_text else ""
+        return (f"{len(panes)} pane(s) · {working} working · "
+                f"{scheds} schedule(s){shown}")
+
+    def set_status(self, text):
+        self.query_one("#status", Static).update(text)
+
+    @property
+    def current(self):
+        t = self.query_one("#table", DataTable)
+        if not self.shown or t.cursor_row is None:
+            return None
+        if 0 <= t.cursor_row < len(self.shown):
+            return self.shown[t.cursor_row]
+        return None
+
+    # --- preview: the biggest win. Look at an agent without leaving. ---
+
+    def on_data_table_row_highlighted(self, _):
+        self.refresh_preview()
+
+    def refresh_preview(self):
+        row = self.current
+        title = self.query_one("#preview-title", Label)
+        body = self.query_one("#preview", Static)
+        if row is None or row.kind != "pane" or not row.agent:
+            title.update("preview")
+            body.update("[dim]select an agent to see its pane[/dim]")
+            return
+        title.update(f"preview · {row.agent}")
+        self.load_preview(row.agent)
+
+    @work(thread=True, exclusive=True, group="preview")
+    def load_preview(self, name):
+        code, out, err = orq("read", name, "--lines", str(PREVIEW_LINES))
+        text = out.rstrip() if code == 0 else f"[red]{err}[/red]"
+        self.call_from_thread(
+            lambda: self.query_one("#preview", Static).update(text))
+
+    # --- actions: the target comes from the selected row, never typed ---
+
+    def action_switch(self):
+        row = self.current
+        if row and row.target:
+            subprocess.run(["tmux", "-L", "orq", "switch-client", "-t", row.target],
+                           capture_output=True)
+            self.exit()
+
+    def action_refresh(self):
+        self.reload()
+
+    def run_and_report(self, *args, ok=None):
+        code, out, err = orq(*args)
+        self.set_status(f"[red]{err}[/red]" if code else f"[green]{ok or out.strip()}[/green]")
+        self.reload()
+
+    def action_kill(self):
+        row = self.current
+        if not row or row.kind != "pane" or not row.agent:
+            return
+        def go(yes):
+            if yes:
+                self.run_and_report("kill", row.agent, ok=f"{row.agent} killed")
+        self.push_screen(Confirm(f"kill agent '{row.agent}'?"), go)
+
+    def action_wt_rm(self):
+        row = self.current
+        if not row or row.kind != "worktree" or not row.worktree:
+            return
+        if row.worktree.startswith("_"):
+            self.set_status("[yellow]that is not a worktree[/yellow]")
+            return
+        def go(yes):
+            if yes:
+                self.run_and_report("wt", "rm", row.worktree, "--ws", row.ws)
+        self.push_screen(
+            Confirm(f"remove worktree '{row.worktree}'?\n"
+                    f"the branch is never deleted, and orq refuses if it is "
+                    f"dirty, unpushed, or has a live agent."), go)
+
+    def action_sched_rm(self):
+        row = self.current
+        if not row or row.kind != "schedule":
+            return
+        def go(yes):
+            if yes:
+                self.run_and_report("schedule", "rm", row.schedule)
+        self.push_screen(Confirm(f"remove schedule '{row.schedule}'?"), go)
+
+    def action_sched_run(self):
+        row = self.current
+        if not row or row.kind != "schedule":
+            return
+        def go(yes):
+            if yes:
+                self.run_and_report("schedule", "run", row.schedule)
+        self.push_screen(Confirm(f"fire '{row.schedule}' now, off schedule?"), go)
+
+    def action_resurrect(self):
+        args = ["resurrect"] + (["--ws", self.ws] if self.ws else [])
+        self.run_and_report(*args)
+
+    # --- filter ---
+
+    def action_filter(self):
+        f = self.query_one("#filter", Input)
+        f.add_class("on")
+        f.focus()
+
+    def action_clear_filter(self):
+        f = self.query_one("#filter", Input)
+        f.value = ""
+        f.remove_class("on")
+        self.filter_text = ""
+        self.query_one("#table", DataTable).focus()
+        self.apply(self.rows, self.err)
+
+    def on_input_changed(self, event: Input.Changed):
+        self.filter_text = event.value
+        self.apply(self.rows, self.err)
+
+    def on_input_submitted(self, _):
+        f = self.query_one("#filter", Input)
+        f.remove_class("on")
+        self.query_one("#table", DataTable).focus()
+
+
+def main():
+    import argparse
+    p = argparse.ArgumentParser(prog="orq-dash",
+                                description="Textual dashboard over orq")
+    p.add_argument("ws", nargs="?", help="workspace (default: all)")
+    p.add_argument("--ws", dest="ws_flag")
+    a = p.parse_args()
+    OrqDash(ws=a.ws_flag or a.ws).run()
+
+
+if __name__ == "__main__":
+    main()

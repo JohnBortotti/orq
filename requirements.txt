@@ -1,2 +1,12 @@
-# Unica dependencia de terceiros. Pinada na versao verificada na asimov.
+# The CLI itself (`orq`) runs on the SYSTEM python and needs only PyYAML,
+# which on this box comes from apt (python3-yaml). Keeping the orchestrator
+# dependency-light is deliberate: it is the property that made Python win over
+# Rust here -- no build, single file, fixable at 2am.
 PyYAML==6.0.3
+
+# The dashboard (`orq-dash`) is a SEPARATE program that consumes `orq ls
+# --json`, and it is the only thing that needs the venv in .venv/.
+# ⚠️ Textual has no LTS track -- it ships continuous releases. 8.2.8 is the
+# version verified here (2026-06-30, Production/Stable, python >=3.9,<4.0),
+# pinned by the same convention as PyYAML.
+textual==8.2.8
