@@ -20,6 +20,7 @@ would undo it.
 """
 
 import json
+import os
 import subprocess
 import time
 
@@ -36,6 +37,13 @@ from textual.screen import ModalScreen
 from textual.theme import Theme
 from textual.widgets import (Button, DataTable, Footer, Header, Input,
                              Label, Static, TabbedContent, TabPane)
+
+# `switch-client` needs an attached client, and outside tmux there is none.
+# `capture-pane` and `send-keys` talk to the SERVER and do not, which is why
+# attach mode still works there. `a` and `enter` stay separate things anyway:
+# one key, one meaning, everywhere -- making `enter` quietly become `a` when
+# there is no client would be the ambiguity, not the fix.
+NO_TMUX = os.environ.get("TMUX") is None
 
 REFRESH_S = 2.0
 PREVIEW_LINES = 60
@@ -625,6 +633,13 @@ class OrqDash(App):
         self.first_load = True
         self.set_interval(REFRESH_S, self.reload)
         self.reload()
+        if NO_TMUX:
+            # In the status bar, not printed before launch: that line scrolled
+            # away the instant the TUI took the screen, so nobody ever saw it.
+            self.set_status(
+                f"[{PAL['warn']}]outside tmux:[/] [bold]enter[/] "
+                f"[{PAL['warn']}]cannot switch panes —[/] [bold]a[/] "
+                f"[{PAL['warn']}]still works[/]", hold=15)
 
     # --- data ---
 
@@ -849,6 +864,15 @@ class OrqDash(App):
         row = self.current
         if not row or not row.target:
             self.set_status(f"[{PAL['warn']}]nothing to switch to on this row[/]")
+            return
+        if NO_TMUX:
+            # Said here rather than surfacing tmux's "no current client",
+            # which explains nothing to somebody who did not know they needed
+            # one.
+            self.set_status(
+                f"[{PAL['warn']}]not running inside tmux — there is no client "
+                f"to switch. use[/] [bold]a[/] "
+                f"[{PAL['warn']}]to work in the pane from here[/]")
             return
         p = subprocess.run(["tmux", "-L", "orq", "switch-client", "-t", row.target],
                            capture_output=True, text=True)
