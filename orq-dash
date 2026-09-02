@@ -25,6 +25,7 @@ import subprocess
 import time
 
 from rich.markup import escape
+from rich.style import Style
 from rich.text import Text
 from datetime import datetime, timezone
 
@@ -241,6 +242,42 @@ def pane_screen(target, keep=None):
         # panel shows fewer, and the input box -- the only part you are about
         # to type into -- lives at the bottom.
         out = "\n".join(out.splitlines()[-keep:])
+    return out
+
+
+def foreground_only(style):
+    """Keep the colour, drop the background and the inversion.
+
+    A pane's background colours are chosen against ITS background, not ours.
+    Rendered over a different surface they arrive as grey slabs behind random
+    lines -- Claude Code tints its own prompt lines, and those tints came
+    through as highlighting that does not exist when you look at the pane
+    directly. Foreground survives because that is the part that still means
+    the same thing anywhere.
+    """
+    return Style(color=style.color, bold=style.bold, italic=style.italic,
+                 dim=style.dim, underline=style.underline,
+                 strike=style.strike)
+
+
+def crop(screen, width):
+    """Cut every line to `width`, keeping its colours.
+
+    `Text.from_ansi(..., no_wrap=True, overflow="crop")` does NOT do this --
+    measured: 120 characters in a 40-wide console still came out as three
+    lines. The only thing that holds is truncating each line explicitly, so
+    there is nothing left for the renderer to wrap.
+    """
+    out = Text(no_wrap=True, overflow="crop")
+    for i, raw in enumerate(screen.splitlines()):
+        t = Text.from_ansi(raw)
+        t.spans = [span.move(0)._replace(style=foreground_only(span.style))
+                   if not isinstance(span.style, str) else span
+                   for span in t.spans]
+        t.truncate(width)
+        if i:
+            out.append("\n")
+        out.append_text(t)
     return out
 
 
@@ -511,10 +548,11 @@ class OrqDash(App):
     #preview.empty { content-align: center middle; text-align: center; }
 
     #sched-title { padding: 0 0 1 0; }
-    #filter, #prompt { display: none; dock: bottom; margin: 0 2;
-                       border: none; background: $panel; }
+    /* height 1: Textual's Input is three rows tall by default, which read as
+       TWO bars appearing instead of one. */
+    #filter, #prompt { display: none; dock: bottom; margin: 0 2; height: 1;
+                       border: none; padding: 0 1; background: $panel; }
     #filter.on, #prompt.on { display: block; }
-    #prompt { border-left: wide $accent; }
     /* NOT docked: it collided with the Footer, which also docks bottom and
        won -- every status message this app produced was painted underneath
        it. In the vertical flow it gets a row of its own. */
@@ -868,7 +906,8 @@ class OrqDash(App):
         # Claude Code draws above and below its input are as wide as ITS pane,
         # and letting them reflow turns every one of them into two ragged
         # lines. Cutting shows less and stays readable.
-        text = Text.from_ansi(screen, no_wrap=True, overflow="crop")
+        width = max(20, self.query_one("#preview").size.width)
+        text = crop(screen, width)
         self.call_from_thread(
             lambda: self.query_one("#preview", Static).update(text))
 
@@ -888,8 +927,8 @@ class OrqDash(App):
         if code == 0:
             # Same reason as attach mode: the pane preview is a screen, not
             # prose, so it is cropped rather than reflowed.
-            body = Text.from_ansi(out.rstrip(), no_wrap=True, overflow="crop") \
-                if kind == "read" else out.rstrip()
+            body = (crop(out.rstrip(), max(20, self.query_one("#preview").size.width))
+                    if kind == "read" else out.rstrip())
         else:
             body = f"[bold {PAL['bad']}]{err}[/]"
         self.call_from_thread(
