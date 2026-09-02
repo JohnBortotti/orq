@@ -38,6 +38,11 @@ from textual.widgets import (Button, DataTable, Footer, Header, Input,
 
 REFRESH_S = 2.0
 PREVIEW_LINES = 60
+# Attach mode polls instead of streaming, so this is the latency of your own
+# keystrokes echoing back. Fine for a prompt or a short command; deliberately
+# not good enough to edit a file in, which is what the real pane is for.
+ATTACH_POLL_S = 0.12
+ATTACH_EXIT = "ctrl+o"
 
 # Textual ships 21 themes. A dashboard you glance at all day wants ONE
 # decision -- dark or light -- not a gallery: every extra entry is noise in the
@@ -206,6 +211,33 @@ def sched_cmd(execstart):
     except ValueError:
         return execstart
     return parts[-1] if parts else execstart
+
+
+def pane_screen(target, keep=None):
+    """The pane's visible screen, WITH its colours.
+
+    `-e` keeps the escape sequences and `-J` unwraps, so what comes back is
+    what is actually on that screen rather than a plain-text approximation.
+    This is a VIEW: the pane goes on living in tmux, owned by tmux, and this
+    only looks at it.
+    """
+    p = subprocess.run(["tmux", "-L", "orq", "capture-pane", "-p", "-e",
+                        "-t", target],
+                       capture_output=True, text=True)
+    if p.returncode != 0:
+        return ""
+    out = p.stdout.rstrip("\n")
+    if keep:
+        # The BOTTOM of the screen, not the top. A pane is 24 lines and the
+        # panel shows fewer, and the input box -- the only part you are about
+        # to type into -- lives at the bottom.
+        out = "\n".join(out.splitlines()[-keep:])
+    return out
+
+
+def send_key(target, key):
+    subprocess.run(["tmux", "-L", "orq", "send-keys", "-t", target, key],
+                   capture_output=True)
 
 
 def line(left, right, width):
@@ -400,6 +432,11 @@ class OrqDash(App):
         background: $surface; border: none;
     }
     #right.hidden { display: none; }
+    /* Attach mode gives the preview the whole window. That is the point: the
+       pane is drawn for ITS width, and squeezing 138 columns into 60 does not
+       make a smaller UI, it makes a broken one. Full width matches. */
+    #right.attached { width: 1fr; margin-left: 0; background: $background; }
+    #left.away { display: none; }
 
     TabbedContent { height: 1fr; }
     TabPane { padding: 1 0 0 0; }
@@ -485,6 +522,8 @@ class OrqDash(App):
         Binding("l", "sched_log", "log"),
         Binding("p", "toggle_preview", "preview"),
         Binding("i", "prompt", "send prompt"),
+        Binding("a", "attach", "attach"),
+        Binding(ATTACH_EXIT, "detach", "leave pane", show=False),
     ]
 
     filter_text = reactive("")
@@ -503,6 +542,9 @@ class OrqDash(App):
         # the 2s refresh redrew the card over the log a moment after `l`, so
         # the log flashed and vanished.
         self.log_for = None
+        # Which pane the keyboard is currently wired to, or None.
+        self.attached = None
+        self.attached_name = None
 
     def compose(self) -> ComposeResult:
         yield Header(icon="")
@@ -690,6 +732,10 @@ class OrqDash(App):
         answer it for a schedule: the exit code says something broke and
         nothing says what.
         """
+        # Attached, the pane owns this panel: the 2s refresh would otherwise
+        # redraw the card over the live screen twice a minute.
+        if self.attached:
+            return
         row = self.current
         title = self.query_one("#preview-title", Label)
         body = self.query_one("#preview", Static)
@@ -745,6 +791,13 @@ class OrqDash(App):
             lines += ["", "[bright_black]press[/bright_black] [b]l[/b] [bright_black]for the log[/bright_black]"]
         return "\n".join(lines)
 
+    @work(thread=True, exclusive=True, group="attach")
+    def load_attached(self, target, keep=None):
+        screen = pane_screen(target, keep)
+        self.call_from_thread(
+            lambda: self.query_one("#preview", Static).update(
+                Text.from_ansi(screen)))
+
     @work(thread=True, exclusive=True, group="preview")
     def load_preview(self, kind, name):
         if kind == "read":
@@ -786,6 +839,76 @@ class OrqDash(App):
         self.log_for = None if self.log_for == row.schedule else row.schedule
         self.refresh_preview()
 
+    def action_attach(self):
+        """Live view of the pane, full width, with the keyboard wired to it.
+
+        The pane keeps living in tmux -- this never owns it. `capture-pane -e`
+        renders what is on that screen and `send-keys` puts keystrokes back, so
+        an agent can be driven without leaving the list you were reading.
+        """
+        row = self.current
+        if not row or row.kind != "pane" or not row.target:
+            self.set_status(f"[{PAL['warn']}]select a live pane first[/]")
+            return
+        self.attached = row.target
+        self.attached_name = row.agent or row.target
+        self.query_one("#left").add_class("away")
+        self.query_one("#right").add_class("attached")
+        self.query_one("#preview", Static).remove_class("empty")
+        self.query_one("#preview-title", Label).update(
+            f"attached · {self.attached_name}   "
+            f"[{PAL['faint']}]{ATTACH_EXIT} to leave[/]")
+        self.attach_timer = self.set_interval(ATTACH_POLL_S, self.tick_attached)
+        self.tick_attached()
+        self.refresh_bindings()
+
+    def tick_attached(self):
+        if self.attached:
+            self.load_attached(self.attached,
+                               max(6, self.query_one("#preview").size.height))
+
+    def action_detach(self):
+        self.attached = None
+        timer = getattr(self, "attach_timer", None)
+        if timer is not None:
+            timer.stop()
+            self.attach_timer = None
+        self.query_one("#left").remove_class("away")
+        self.query_one("#right").remove_class("attached")
+        self.active_table.focus()
+        self.refresh_preview()
+        self.refresh_bindings()
+
+    # tmux key names differ from Textual's; anything not listed goes through
+    # as a literal character, which is what makes normal typing work.
+    KEYMAP = {"enter": "Enter", "escape": "Escape", "tab": "Tab",
+              "backspace": "BSpace", "up": "Up", "down": "Down",
+              "left": "Left", "right": "Right", "home": "Home", "end": "End",
+              "pageup": "PageUp", "pagedown": "PageDown", "delete": "DC",
+              "space": "Space", "insert": "IC"}
+
+    def on_key(self, event):
+        """While attached, EVERY key goes to the pane. Letting half of them
+        trigger dashboard actions and the other half arrive would be worse
+        than either -- so there is exactly one key that does not: the exit."""
+        if not self.attached:
+            return
+        event.stop()
+        event.prevent_default()
+        if event.key == ATTACH_EXIT:
+            self.action_detach()
+            return
+        if event.key in self.KEYMAP:
+            send_key(self.attached, self.KEYMAP[event.key])
+        elif event.character and len(event.character) == 1:
+            # `-l` sends the character literally, so `k` types a k instead of
+            # being read as a key name.
+            subprocess.run(["tmux", "-L", "orq", "send-keys", "-t",
+                            self.attached, "-l", event.character],
+                           capture_output=True)
+        else:
+            send_key(self.attached, event.key)
+
     def action_toggle_preview(self):
         right = self.query_one("#right")
         right.toggle_class("hidden")
@@ -810,10 +933,13 @@ class OrqDash(App):
     # Actions that only make sense on one tab. `check_action` both hides them
     # from the footer AND disables the key, so this is not decoration: `x` on
     # the workspaces tab no longer half-works on a schedule you cannot see.
-    WS_ONLY = {"switch", "kill", "wt_rm", "prompt", "resurrect"}
+    WS_ONLY = {"switch", "kill", "wt_rm", "prompt", "resurrect", "attach"}
     SCHED_ONLY = {"sched_rm", "sched_run", "sched_log"}
 
     def check_action(self, action, parameters):
+        # Attached, the dashboard has exactly one command: leave.
+        if self.attached:
+            return action == "detach"
         try:
             on_sched = self.query_one("#tabs", TabbedContent).active == "tab-sched"
         except Exception:
