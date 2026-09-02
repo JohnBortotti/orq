@@ -550,8 +550,13 @@ class OrqDash(App):
     #sched-title { padding: 0 0 1 0; }
     /* height 1: Textual's Input is three rows tall by default, which read as
        TWO bars appearing instead of one. */
-    #filter, #prompt { display: none; dock: bottom; margin: 0 2; height: 1;
-                       border: none; padding: 0 1; background: $panel; }
+    /* NOT docked, for the same reason the status bar is not: the Footer
+       docks bottom too and wins, so the input was being drawn underneath it
+       -- you were typing behind the footer. Hidden they take no space, so the
+       vertical flow costs nothing. */
+    #filter, #prompt { display: none; margin: 0 2; height: 1;
+                       border: none; padding: 0 1;
+                       background: $panel; color: $foreground; }
     #filter.on, #prompt.on { display: block; }
     /* NOT docked: it collided with the Footer, which also docks bottom and
        won -- every status message this app produced was painted underneath
