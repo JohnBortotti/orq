@@ -1,23 +1,31 @@
 # orq
 
-Orquestrador de agentes sobre `tmux`, `git worktree` e `systemd`.
+Agent orchestrator over `tmux`, `git worktree` and `systemd`.
 
-CLI fina: cada subcomando é uma ou duas chamadas de tmux, git ou systemd com nome
-bonito. A orquestração — grafo, ordem, quem faz o quê — não mora aqui; mora na
-skill e no prompt.
+A thin CLI: each subcommand is one or two calls to tmux, git or systemd with a
+decent name. The orchestration -- the graph, the order, who does what -- does
+not live here; it lives in the skill and in the prompt.
 
-**O plano é a fonte de verdade**, e vive fora deste repo:
-`notes/projects/orq/index.md` no vault.
+**The plan is the source of truth**, and it lives outside this repo:
+`notes/projects/orq/index.md` in the vault.
 
-## Estado
+## Layout
 
-Fase 1 não implementada. Este repo tem a superfície de comandos e as constantes
-que o plano fixa; nenhuma lógica.
+| file | what it is |
+|---|---|
+| `orq` | the CLI. One file, stdlib + PyYAML. No build, readable in an afternoon, fixable at 2am. |
+| `orq-dash` | the dashboard. A separate program that talks to `orq` only through `ls --json`, `schedule ls --json` and `read`. Needs the venv. |
 
-## Instalação (quando houver o que instalar)
+`orq dash` runs `orq-dash` for you -- one command surface, but `orq` never
+imports Textual, so the orchestrator stays dependency-light.
+
+## Install
 
 ```bash
 ln -s ~/workspace/orq/orq ~/.local/bin/orq
+
+# the dashboard only
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ```
 
-Requer `tmux`, `git` e `python3` — todos já presentes. Sem dependência de terceiros.
+Requires `tmux`, `git`, `systemd --user` and `python3`.

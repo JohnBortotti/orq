@@ -10,7 +10,6 @@ import argparse
 import fcntl
 import json
 import os
-import curses
 import re
 import shlex
 import shutil
@@ -1613,265 +1612,36 @@ def cmd_ls(args):
             print("  " + fmt_schedule(s_, indent="  ").replace("\n", "\n  "))
 
 
-# --- dash: TUI read-only ----------------------------------------------------
-#
-# READ-ONLY by the user's decision (2026-08-30): the TUI never sends anything.
-# The one who types is him, inside tmux. So it needs exactly two things -- the
-# tree `ls` already builds, and `tmux switch-client`. No input box, no `send`,
-# no `keys`. That is what keeps it cheap, and what stops orq from growing a
-# second place where state lives.
-
-DASH_REFRESH_S = 2.0
-
-
-def age_since(iso):
-    """'12m', '3h', '2d' -- the most useful number for whoever is orchestrating,
-    because it is how a stuck agent becomes visible. `ls` deliberately does not
-    carry it: it is derived, and derived belongs to the presentation."""
-    if not iso:
-        return ""
-    try:
-        delta = datetime.now(timezone.utc) - datetime.fromisoformat(iso).astimezone(timezone.utc)
-    except ValueError:
-        return ""
-    seg = int(delta.total_seconds())
-    if seg < 60:
-        return f"{seg}s"
-    if seg < 3600:
-        return f"{seg // 60}m"
-    if seg < 86400:
-        return f"{seg // 3600}h"
-    return f"{seg // 86400}d"
-
-
-def when_short(ts):
-    """`Wed 2026-09-02 08:03:00 -03` -> `wed 08:03`, and `today 19:03` when it
-    is today. The full date neither fits nor informs: what you look for on a
-    panel is whether it is today, and at what time."""
-    if not ts or ts == "-":
-        return "-"
-    # O systemd imprime o fuso como `-03`, e `%z` do strptime quer `-0300`.
-    body = " ".join(ts.split()[:3])          # descarta o offset
-    try:
-        d = datetime.strptime(body, "%a %Y-%m-%d %H:%M:%S")
-    except ValueError:
-        return ts[:16]
-    hoje = datetime.now().date()
-    days = (d.date() - hoje).days
-    dia = {0: "today", 1: "tomorrow"}.get(
-        days, ["mon", "tue", "wed", "thu", "fri", "sat", "sun"][d.weekday()])
-    return f"{dia} {d:%H:%M}"
-
-
-def sched_cmd(execstart):
-    """`/bin/bash -lc 'cmd'` -> `cmd`. The wrapper is a detail of how systemd
-    executes, not information for whoever is looking at the panel."""
-    if not execstart:
-        return ""
-    try:
-        parts = shlex.split(execstart)
-    except ValueError:
-        return execstart
-    return parts[-1] if parts else execstart
-
-
-def sched_result(name):
-    """Result of the LAST run. `schedule ls` shows the timer's state, which does
-    not say whether the job passed or broke -- a schedule that fails every day
-    looks healthy there."""
-    r = systemctl("show", f"{SCHED_PREFIX}{name}.service",
-                  "--property=Result", "--property=ExecMainStatus",
-                  "--property=ExecMainStartTimestamp", check=False)
-    d = dict(l.split("=", 1) for l in r.stdout.splitlines() if "=" in l)
-    # `ActiveEnterTimestamp` is NO USE here: a Type=oneshot goes inactive
-    # immediately and never fills it in, not even on success -- the first
-    # version of this returned "-" for everything, including the job that had
-    # just failed. The one that says "it already ran" is ExecMainStartTimestamp.
-    if not d.get("ExecMainStartTimestamp"):
-        return "-"
-    if d.get("Result") == "success":
-        return "ok"
-    return f"{d.get('Result') or '?'} ({d.get('ExecMainStatus')})"
-
-
-def dash_rows(_ws, width=100):
-    """Rows ready to draw: (kind, left, right, target, color).
-
-    `left` and `right` are pinned to the two edges by the renderer, so the full
-    width of the screen is used instead of everything crammed to the left.
-    """
-    rows = []
-    tree = ls_tree(_ws)
-    scheds = schedule_rows()
-
-    for w in tree:
-        panes_todos = [p for wt in w["worktrees"] for p in wt["panes"]] + w["lead"]["panes"]
-        working = sum(1 for p in panes_todos if p.get("status") == "working")
-        agents = sum(1 for p in panes_todos if p.get("name"))
-        state_txt = "session alive" if w["session_alive"] else "SESSION DEAD"
-        rows.append(("head", f" {w['workspace']} ",
-                       f"{state_txt} · {agents} agent(s) · {working} working ",
-                       None, "ok" if w["session_alive"] else "bad"))
-
-        rows.append(("colhead",
-                       f"    {'':2}{'agent':<16}{'process':<10}{'state':<9}"
-                       f"{'age':>5}",
-                       "parent · pane ", None, "dim"))
-        groups = [(w["lead"]["window"], None, w["lead"]["panes"], w["lead"]["root"])]
-        for wt in w["worktrees"]:
-            notes = []
-            if wt["exists"] is False:
-                notes.append("path gone")
-            elif not wt["window_alive"]:
-                notes.append("no window · orq resurrect")
-            if wt["dirty"]:
-                notes.append("dirty")
-            groups.append((wt["worktree"], wt["branch"], wt["panes"],
-                           " · ".join(notes)))
-
-        for window, branch, panes, nota in groups:
-            left = f"  {window}" + (f"  [{branch}]" if branch else "")
-            color = "bad" if "sem window" in (nota or "") else "dim"
-            rows.append(("sub", left, (nota or "") + " ", None, color))
-            for pane in panes:
-                name = pane["name"]
-                st = pane.get("status") or ""
-                color = {"working": "warn", "done": "ok"}.get(st, "dim")
-                age = age_since(pane.get("status_at"))
-                left = (f"    {'●' if name else '○'} {(name or '-'):<16}"
-                       f"{pane['command']:<10}{st:<9}{age:>5}")
-                right = (f"{pane['parent'] + ' <- ' if pane.get('parent') else ''}"
-                        f"{pane['pane']} ")
-                target = f"{w['session']}:{window}.{pane['pane']}" if w["session_alive"] else None
-                rows.append(("pane", left, right, target, color))
-        rows.append(("gap", "", "", None, "dim"))
-
-    rows.append(("head", " schedules ",
-                   f"{len(scheds)} scheduled " if scheds else "none ",
-                   None, "ok"))
-    # Description width derived from the screen: 4 of indent + 16 for the name
-    # + 14 for the next run + 16 for the result, minus the right-hand column.
-    col_desc = max(12, width - 50 - 12)
-    if scheds:
-        rows.append(("colhead",
-                       f"    {'name':<16}{'next run':<14}{'last run':<16}"
-                       f"{'what it does':<{col_desc}}",
-                       "created by ", None, "dim"))
-    for sc in scheds:
-        res = sched_result(sc["name"])
-        color = {"ok": "ok", "-": "dim"}.get(res, "bad")
-        # the description, when present, is what the person meant to say; the
-        # command is the technical detail and becomes the fallback.
-        what = sc.get("desc") or sched_cmd(sc["exec"])
-        if len(what) > col_desc:
-            what = what[:col_desc - 1] + "…"
-        left = (f"    {sc['name']:<16}{when_short(sc['next']):<14}"
-               f"{res:<16}{what:<{col_desc}}")
-        rows.append(("sched", left, (sc["creator"] or "") + " ", None, color))
-    return rows
-
+# --- dash: hands over to the separate Textual program ------------------------
 
 def cmd_dash(args):
-    _ws = ws_arg(args)
+    """`orq dash` runs `orq-dash`, a SEPARATE program that lives beside this
+    file and talks to orq only through the CLI contract.
 
-    def loop(screen):
-        curses.curs_set(0)
-        # The keyboard answers in 80ms; the DATA is rebuilt every
-        # DASH_REFRESH_S. Before, the rebuild happened on every keystroke and
-        # navigation carried the full 227ms of collection.
-        screen.timeout(80)
-        colors = {}
-        if curses.has_colors():
-            curses.start_color()
-            curses.use_default_colors()
-            for i, (name, color) in enumerate(
-                    [("ok", curses.COLOR_GREEN), ("warn", curses.COLOR_YELLOW),
-                     ("bad", curses.COLOR_RED), ("dim", -1),
-                     ("bar", curses.COLOR_CYAN)], start=1):
-                curses.init_pair(i, color, -1)
-                colors[name] = curses.color_pair(i)
-
-        rows, next_at, sel, top, err = [], 0.0, 0, 0, None
-        last_width = 0
-        while True:
-            agora = time.monotonic()
-            height, width = screen.getmaxyx()
-            if agora >= next_at or width != last_width:
-                last_width = width
-                try:
-                    rows, err = dash_rows(_ws, width), None
-                except OrqError as e:
-                    rows, err = [], str(e)
-                next_at = agora + DASH_REFRESH_S
-
-            selectable = [i for i, l in enumerate(rows) if l[0] in ("pane", "sched")]
-            if selectable:
-                sel = max(0, min(sel, len(selectable) - 1))
-
-            screen.erase()
-            body = height - 2
-
-            def draw_row(y, left, right, attr):
-                espaco = width - len(left) - len(right)
-                text = left + (" " * espaco + right if espaco > 0 else "")
-                try:
-                    screen.addnstr(y, 0, text.ljust(width)[:width - 1], width - 1, attr)
-                except curses.error:
-                    pass
-
-            title = f" orq · {_ws or 'all workspaces'}"
-            draw_row(0, title, time.strftime("%H:%M:%S "),
-                    curses.A_REVERSE | curses.A_BOLD)
-
-            if selectable:
-                pos = selectable[sel]
-                top = min(top, pos)
-                top = max(top, pos - body + 2)
-            top = max(0, min(top, max(0, len(rows) - body + 1)))
-
-            for y, line in enumerate(rows[top:top + body - 1], start=1):
-                kind, left, right, _alvo, color = line
-                idx = top + y - 1
-                attr = colors.get(color, 0)
-                if kind == "head":
-                    attr |= curses.A_BOLD | curses.A_UNDERLINE
-                elif kind == "colhead":
-                    attr |= curses.A_DIM | curses.A_UNDERLINE
-                if selectable and idx == selectable[sel]:
-                    attr |= curses.A_REVERSE
-                draw_row(y, left, right, attr)
-
-            help_line = " j/k move · Enter open · r refresh · q quit"
-            draw_row(height - 1, err or help_line, "read-only ",
-                    curses.A_REVERSE | (colors.get("bad", 0) if err else 0))
-            screen.refresh()
-
-            k = screen.getch()
-            if k == -1:
-                continue
-            if k in (ord("q"), 27):
-                return
-            if k in (ord("j"), curses.KEY_DOWN) and selectable:
-                sel = min(sel + 1, len(selectable) - 1)
-            elif k in (ord("k"), curses.KEY_UP) and selectable:
-                sel = max(sel - 1, 0)
-            elif k == ord("g"):
-                sel, top = 0, 0
-            elif k == ord("G") and selectable:
-                sel = len(selectable) - 1
-            elif k == ord("r"):
-                next_at = 0.0
-            elif k in (10, 13, curses.KEY_ENTER) and selectable:
-                target = rows[selectable[sel]][3]
-                if target:
-                    # The ONLY action of the TUI, and it does not even send
-                    # text: it hands control to tmux and leaves the stage.
-                    tmux("switch-client", "-t", target, check=False)
-                    return
-
-    if not os.environ.get("TMUX"):
-        print("note: outside tmux, Enter cannot switch panes")
-    curses.wrapper(loop)
+    Separate program, same command: orq never imports Textual, so it keeps the
+    property that made Python win over Rust here -- one file, no build, fixable
+    at 2am -- while the user still has one surface to remember. The coupling is
+    a path, not an import: if the dashboard is missing or its venv is not set
+    up, this says so instead of pretending the command does not exist.
+    """
+    sibling = Path(sys.argv[0]).resolve().parent / "orq-dash"
+    if not sibling.exists():
+        raise OrqError(
+            f"dashboard not installed: {sibling} is missing.\n"
+            f"  it is a separate program; see requirements.txt"
+        )
+    rest = []
+    ws = ws_arg(args)
+    if ws:
+        rest = ["--ws", ws]
+    try:
+        os.execv(str(sibling), [str(sibling), *rest])
+    except OSError as e:
+        raise OrqError(
+            f"could not start {sibling}: {e}\n"
+            f"  the dashboard needs its venv: python3 -m venv .venv && "
+            f".venv/bin/pip install -r requirements.txt"
+        )
 
 
 def cmd_log(args):
@@ -1985,7 +1755,7 @@ def build_parser():
     sp.add_argument("--json", action="store_true"); sp.add_argument("--ws")
     sp.set_defaults(func=cmd_ls)
 
-    sp = sub.add_parser("dash", help="read-only TUI over workspaces and schedules")
+    sp = sub.add_parser("dash", help="Textual dashboard (runs orq-dash)")
     sp.add_argument("ws_pos", nargs="?", metavar="ws")
     sp.add_argument("--ws")
     sp.set_defaults(func=cmd_dash)
