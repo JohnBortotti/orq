@@ -29,17 +29,32 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.reactive import reactive
 from textual.screen import ModalScreen
-from textual.widgets import (DataTable, Footer, Header, Input, Label, Static)
+from textual.theme import Theme
+from textual.widgets import (Button, DataTable, Footer, Header, Input,
+                             Label, Static, TabbedContent, TabPane)
 
 REFRESH_S = 2.0
 PREVIEW_LINES = 60
 
-# Textual ships 21 themes. A dashboard you glance at all day wants one
-# decision -- dark or light -- not a gallery: every extra entry is noise in
-# the command palette and one more thing that can render the status colours
-# differently from what was designed against.
+# Textual ships 21 themes. A dashboard you glance at all day wants ONE
+# decision -- dark or light -- not a gallery: every extra entry is noise in the
+# command palette and one more way the status colours drift from what they
+# were designed against. Both are defined here rather than picked from the
+# built-ins, so the two read as the same product.
+ORQ_LIGHT = Theme(
+    name="orq-light", dark=False,
+    background="#f7f8fa", surface="#ffffff", panel="#eceff4",
+    foreground="#1f2430", primary="#3b5bdb", secondary="#7048e8",
+    accent="#0c8599", success="#2f9e44", warning="#e8590c", error="#e03131",
+)
+ORQ_DARK = Theme(
+    name="orq-dark", dark=True,
+    background="#0f1117", surface="#161922", panel="#1e2230",
+    foreground="#c8d0e0", primary="#7aa2f7", secondary="#bb9af7",
+    accent="#7dcfff", success="#9ece6a", warning="#e0af68", error="#f7768e",
+)
 # Light first: it is what he works in.
-THEMES = ("textual-light", "textual-dark")
+THEMES = ("orq-light", "orq-dark")
 
 
 # --- talking to orq ----------------------------------------------------------
@@ -309,26 +324,53 @@ class Confirm(ModalScreen[bool]):
 
 class OrqDash(App):
     CSS = """
-    Screen { layout: vertical; }
-    #body { height: 1fr; }
-    #left { width: 5fr; }
-    #right { width: 4fr; border-left: solid $panel; }
+    Screen { layout: vertical; background: $background; }
+    #body { height: 1fr; padding: 0 1; }
+
+    /* Rounded panels with titles instead of bare tables butted against each
+       other -- the flat grid is what made this read as a terminal dump. */
+    #left  { width: 5fr; }
+    #right {
+        width: 4fr; margin-left: 1;
+        border: round $primary 40%; background: $surface;
+    }
+    #right.hidden { display: none; }
+
+    TabbedContent { height: 1fr; }
+    TabPane { padding: 0; }
+
+    DataTable {
+        height: 1fr; background: $surface;
+        border: round $primary 40%; padding: 0 1;
+        scrollbar-size: 1 1;
+    }
+    DataTable > .datatable--header {
+        background: $surface; color: $text-muted; text-style: none;
+    }
+    DataTable > .datatable--cursor { background: $primary 25%; }
+
+    #preview-head { height: 1; padding: 0 1; }
+    #preview-title { width: 1fr; color: $accent; text-style: bold; }
+    /* A flat one-line button: Button's default border eats three rows and
+       reads like a dialog widget dropped into a status bar. */
+    #preview-toggle {
+        min-width: 8; width: auto; height: 1; padding: 0 1;
+        border: none; background: $panel; color: $text-muted;
+    }
+    #preview-toggle:hover { background: $primary 30%; color: $text; }
     #preview { padding: 0 1; }
-    #preview-title { background: $panel; padding: 0 1; }
-    #legend { padding: 0 1; color: $text-muted; background: $panel; }
-    /* The schedules pane is short on purpose: there are few of them, and the
-       agents tree is what grows. */
-    #sched-title { padding: 0 1; background: $panel; color: $text-muted; }
-    #scheds { height: 9; }
-    #filter { display: none; dock: bottom; }
+
+    #legend { padding: 0 1; color: $text-muted; }
+    #sched-title { padding: 0 1; color: $text-muted; }
+    #filter { display: none; dock: bottom; margin: 0 1; }
     #filter.on { display: block; }
-    #status { dock: bottom; height: 1; padding: 0 1; color: $text-muted; }
+    #status { dock: bottom; height: 1; padding: 0 2; color: $text-muted; }
+
     #confirm-box {
-        width: 60; height: auto; padding: 1 2;
-        background: $surface; border: thick yellow; align: center middle;
+        width: 64; height: auto; padding: 1 2;
+        background: $surface; border: round $warning;
     }
     Confirm { align: center middle; }
-    DataTable { height: 1fr; }
     """
 
     BINDINGS = [
@@ -343,8 +385,12 @@ class OrqDash(App):
         Binding("escape", "clear_filter", "clear filter", show=False),
         Binding("r", "refresh", "refresh"),
         Binding("t", "theme", "dark/light"),
-        Binding("tab", "next_table", "agents/schedules"),
+        # NOT `tab`: Textual reserves it for focus traversal and eats the
+        # binding before it ever reaches the app.
+        Binding("1", "tab_ws", "workspaces"),
+        Binding("2", "tab_sched", "schedules"),
         Binding("l", "sched_log", "job log"),
+        Binding("p", "toggle_preview", "preview"),
     ]
 
     filter_text = reactive("")
@@ -368,17 +414,24 @@ class OrqDash(App):
         yield Header(show_clock=True)
         with Horizontal(id="body"):
             with Vertical(id="left"):
-                # The legend answers the question the table kept raising --
-                # what IS each of these lines -- without a manual.
-                yield Static(
-                    "[b]▌[/b] workspace   ├ worktree   ● agent   ○ free pane"
-                    "        [dim]tab switches to schedules[/dim]",
-                    id="legend")
-                yield DataTable(id="table", cursor_type="row", zebra_stripes=False)
-                yield Static("", id="sched-title")
-                yield DataTable(id="scheds", cursor_type="row", zebra_stripes=False)
+                # Two tabs instead of two stacked tables: they answer different
+                # questions, and stacking meant the schedules were always
+                # squeezed under whatever the agents tree happened to need.
+                with TabbedContent(id="tabs"):
+                    with TabPane("Workspaces", id="tab-ws"):
+                        yield Static(
+                            "[b]▌[/b] workspace   ├ worktree   "
+                            "● agent   ○ free pane", id="legend")
+                        yield DataTable(id="table", cursor_type="row",
+                                        zebra_stripes=False)
+                    with TabPane("Schedules", id="tab-sched"):
+                        yield Static("", id="sched-title")
+                        yield DataTable(id="scheds", cursor_type="row",
+                                        zebra_stripes=False)
             with Vertical(id="right"):
-                yield Label("preview", id="preview-title")
+                with Horizontal(id="preview-head"):
+                    yield Label("preview", id="preview-title")
+                    yield Button("hide", id="preview-toggle")
                 yield Static("", id="preview")
         yield Input(placeholder="filter…", id="filter")
         yield Static("", id="status")
@@ -388,6 +441,8 @@ class OrqDash(App):
         # Drop every theme but the two. `available_themes` is the source the
         # command palette reads, so unregistering is what actually removes
         # them from the picker -- setting `theme` alone would not.
+        self.register_theme(ORQ_LIGHT)
+        self.register_theme(ORQ_DARK)
         for name in list(self.available_themes):
             if name not in THEMES:
                 self.unregister_theme(name)
@@ -398,7 +453,7 @@ class OrqDash(App):
         # Fixed widths added up to more than the pane, so `detail` was cut and
         # the table grew a horizontal scrollbar. The last column takes what is
         # left instead.
-        for col, width in (("name", 26), ("process", 11), ("state", 8),
+        for col, width in (("name", 24), ("process", 10), ("state", 7),
                            ("age", 4)):
             t.add_column(col, width=width)
         # No width: the last column takes whatever is left, instead of a fixed
@@ -412,6 +467,7 @@ class OrqDash(App):
         sc.add_column("")
         # Without this the arrow keys never reach the table and nothing moves.
         t.focus()
+        self.query_one("#preview-toggle", Button).can_focus = False
         self.first_load = True
         self.set_interval(REFRESH_S, self.reload)
         self.reload()
@@ -484,19 +540,20 @@ class OrqDash(App):
 
     @property
     def current(self):
-        """Whichever table has focus owns the selection, so every action reads
-        the right thing without a mode to remember."""
-        if self.focused is not None and self.focused.id == "scheds":
+        """The visible tab owns the selection, so every action reads the right
+        thing with no mode to remember."""
+        try:
+            tabs = self.query_one("#tabs", TabbedContent)
+        except Exception:
+            return None
+        if tabs.active == "tab-sched":
             sc = self.query_one("#scheds", DataTable)
-            if self.sched_shown and sc.cursor_row is not None \
-                    and 0 <= sc.cursor_row < len(self.sched_shown):
-                return self.sched_shown[sc.cursor_row]
-            return None
-        t = self.query_one("#table", DataTable)
-        if not self.shown or t.cursor_row is None:
-            return None
-        if 0 <= t.cursor_row < len(self.shown):
-            return self.shown[t.cursor_row]
+            rows, cur = self.sched_shown, sc.cursor_row
+        else:
+            t = self.query_one("#table", DataTable)
+            rows, cur = self.shown, t.cursor_row
+        if rows and cur is not None and 0 <= cur < len(rows):
+            return rows[cur]
         return None
 
     # --- preview: the biggest win. Look at an agent without leaving. ---
@@ -616,9 +673,36 @@ class OrqDash(App):
         self.log_for = None if self.log_for == row.schedule else row.schedule
         self.refresh_preview()
 
-    def action_next_table(self):
-        target = "#table" if (self.focused and self.focused.id == "scheds") else "#scheds"
-        self.query_one(target, DataTable).focus()
+    def action_toggle_preview(self):
+        right = self.query_one("#right")
+        right.toggle_class("hidden")
+        hidden = right.has_class("hidden")
+        self.query_one("#preview-toggle", Button).label = "show" if hidden else "hide"
+
+    def on_button_pressed(self, event: Button.Pressed):
+        if event.button.id == "preview-toggle":
+            self.action_toggle_preview()
+            # Give the keyboard back: clicking a button steals focus, and the
+            # arrow keys would stop moving the table.
+            self.active_table.focus()
+
+    @property
+    def active_table(self):
+        """The table of whichever tab is showing. Tabs replaced Tab-to-switch,
+        so the selection follows the visible pane, not the focus history."""
+        tabs = self.query_one("#tabs", TabbedContent)
+        which = "#scheds" if tabs.active == "tab-sched" else "#table"
+        return self.query_one(which, DataTable)
+
+    def action_tab_ws(self):
+        self.query_one("#tabs", TabbedContent).active = "tab-ws"
+
+    def action_tab_sched(self):
+        self.query_one("#tabs", TabbedContent).active = "tab-sched"
+
+    def on_tabbed_content_tab_activated(self, _):
+        self.log_for = None
+        self.active_table.focus()
         self.refresh_preview()
 
     def action_theme(self):
