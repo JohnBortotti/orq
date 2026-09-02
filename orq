@@ -1402,6 +1402,27 @@ def cmd_schedule_add(args):
     print(f"  command: {cmd}")
 
 
+def sched_result(name):
+    """Result of the LAST run. `schedule ls` shows the timer's state, which
+    does not say whether the job passed or broke -- a schedule that fails
+    every day looks healthy there.
+
+    `ActiveEnterTimestamp` is NO USE here: a Type=oneshot goes inactive
+    immediately and never fills it in, not even on success -- the first
+    version of this returned "-" for everything, including the job that had
+    just failed. The one that says "it already ran" is ExecMainStartTimestamp.
+    """
+    r = systemctl("show", f"{SCHED_PREFIX}{name}.service",
+                  "--property=Result", "--property=ExecMainStatus",
+                  "--property=ExecMainStartTimestamp", check=False)
+    d = dict(l.split("=", 1) for l in r.stdout.splitlines() if "=" in l)
+    if not d.get("ExecMainStartTimestamp"):
+        return "-"
+    if d.get("Result") == "success":
+        return "ok"
+    return f"{d.get('Result') or '?'} ({d.get('ExecMainStatus')})"
+
+
 def schedule_rows():
     """Rows of schedules, read from systemd. Shared by `schedule ls` and by
     `ls` -- the plan wants schedules and workspaces on the SAME dashboard.
@@ -1423,6 +1444,10 @@ def schedule_rows():
             "next": d.get("NextElapseUSecRealtime") or None,
             "last": d.get("LastTriggerUSec") or None,
             "creator": meta.get("creator"),
+            # The single most important fact about a schedule, and the one
+            # `systemctl list-timers` does not carry: a job that fails every
+            # day looks perfectly healthy there.
+            "result": sched_result(name),
             "calendar": meta.get("calendar"), "exec": meta.get("exec"),
             "desc": meta.get("desc") or "",
         })
@@ -1451,6 +1476,21 @@ def cmd_schedule_ls(args):
         return
     for s_ in rows:
         print(fmt_schedule(s_))
+
+
+def cmd_schedule_log(args):
+    """What the last run printed. The `orq read` of a schedule.
+
+    Without it there is nowhere to answer "why did it fail" -- the exit code
+    says something broke and nothing says what. journalctl already keeps it;
+    this only points at the right unit so nobody has to remember the name
+    mangling."""
+    if args.name not in sched_units():
+        raise OrqError(f"schedule '{args.name}' does not exist")
+    p = run(["journalctl", "--user", "-u", f"{SCHED_PREFIX}{args.name}.service",
+             "-n", str(args.lines), "--no-pager", "-o", "cat"], check=False)
+    out = (p.stdout or "").rstrip()
+    print(out or "(no output recorded for this schedule yet)")
 
 
 def cmd_schedule_rm(args):
@@ -1781,6 +1821,11 @@ def build_parser():
     add.set_defaults(func=cmd_schedule_add)
     sls = sc.add_parser("ls"); sls.add_argument("--json", action="store_true")
     sls.set_defaults(func=cmd_schedule_ls)
+    slog = sc.add_parser("log", help="what the last run printed")
+    slog.add_argument("name")
+    slog.add_argument("--lines", type=int, default=200)
+    slog.set_defaults(func=cmd_schedule_log)
+
     srm = sc.add_parser("rm"); srm.add_argument("name")
     srm.set_defaults(func=cmd_schedule_rm)
     srun = sc.add_parser("run", help="fire now, without waiting for the schedule")

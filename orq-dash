@@ -38,7 +38,8 @@ PREVIEW_LINES = 60
 # decision -- dark or light -- not a gallery: every extra entry is noise in
 # the command palette and one more thing that can render the status colours
 # differently from what was designed against.
-THEMES = ("textual-dark", "textual-light")
+# Light first: it is what he works in.
+THEMES = ("textual-light", "textual-dark")
 
 
 # --- talking to orq ----------------------------------------------------------
@@ -96,6 +97,48 @@ def when_short(ts):
     return f"{label} {d:%H:%M}"
 
 
+def until(ts):
+    """`in 3h`, `in 12m`, `overdue`. A schedule is judged by PROXIMITY, not by
+    a timestamp: "today 06:00" makes you do the arithmetic, "in 3h" does not.
+    """
+    if not ts or ts == "-":
+        return "—"
+    try:
+        d = datetime.strptime(" ".join(ts.split()[:3]), "%a %Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return ts[:16]
+    secs = int((d - datetime.now()).total_seconds())
+    if secs < 0:
+        return "overdue"
+    if secs < 90:
+        return "now"
+    if secs < 3600:
+        return f"in {secs // 60}m"
+    if secs < 86400:
+        return f"in {secs // 3600}h"
+    return f"in {secs // 86400}d"
+
+
+def ago(ts):
+    """`2h ago`, or `never`."""
+    if not ts or ts == "-":
+        return "never"
+    try:
+        d = datetime.strptime(" ".join(ts.split()[:3]), "%a %Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return ts[:16]
+    secs = int((datetime.now() - d).total_seconds())
+    if secs < 0:
+        return "—"
+    if secs < 90:
+        return "just now"
+    if secs < 3600:
+        return f"{secs // 60}m ago"
+    if secs < 86400:
+        return f"{secs // 3600}h ago"
+    return f"{secs // 86400}d ago"
+
+
 def sched_cmd(execstart):
     """`/bin/bash -lc 'cmd'` -> `cmd`."""
     if not execstart:
@@ -115,7 +158,7 @@ class Row:
     the user typing a name."""
 
     def __init__(self, kind, cells, *, agent=None, worktree=None, schedule=None,
-                 ws=None, target=None, status=None):
+                 ws=None, target=None, status=None, detail=None):
         self.kind = kind          # "pane" | "worktree" | "schedule"
         self.cells = cells
         self.agent = agent
@@ -124,6 +167,7 @@ class Row:
         self.ws = ws
         self.target = target      # session:window.pane, for switch-client
         self.status = status
+        self.detail = detail      # raw JSON, for the on-demand card
 
     @property
     def label(self):
@@ -131,7 +175,14 @@ class Row:
 
 
 def collect(ws_filter=None):
-    """Builds every row from the CLI contract. Returns (rows, error)."""
+    """Builds every row from the CLI contract. Returns (rows, error).
+
+    Three kinds of thing live in one table, and until 2026-09-02 they all
+    looked alike: with four workspaces on screen there were four identical
+    `_lead` lines and nothing saying which was whose. Each level now gets its
+    own glyph and indent, and the legend above the table spells them out --
+    the hierarchy has to be readable without knowing orq's vocabulary.
+    """
     args = ["ls", "--json"] + (["--ws", ws_filter] if ws_filter else [])
     data, err = orq_json(*args)
     if err:
@@ -140,45 +191,95 @@ def collect(ws_filter=None):
     for w in (data or {}).get("workspaces", []):
         session = w["session"]
         alive = w["session_alive"]
-        groups = [(w["lead"]["window"], None, w["lead"]["panes"], w["lead"]["root"], None)]
+        panes_all = [p for wt in w["worktrees"] for p in wt["panes"]] + w["lead"]["panes"]
+        agents = sum(1 for p in panes_all if p.get("name"))
+        working = sum(1 for p in panes_all if p.get("status") == "working")
+        # Only say something when it is NOT the normal case: "alive" on every
+        # row is noise, and the column is the one that keeps getting cut.
+        state = "" if alive else "[red]SESSION DEAD · [/red]"
+        busy = f"[bold yellow]{working} working[/]" if working else "[dim]idle[/dim]"
+        rows.append(Row(
+            "workspace",
+            [f"[bold cyan]▌ {w['workspace']}[/]", "", "", "",
+             f"{state}[dim]{agents} agents ·[/dim] {busy}"],
+            ws=w["workspace"]))
+
+        groups = [(w["lead"]["window"], None, w["lead"]["panes"],
+                   f"root {w['lead']['root']}", None)]
         for wt in w["worktrees"]:
             notes = []
             if wt["exists"] is False:
-                notes.append("path gone")
+                notes.append("[red]path gone[/red]")
             elif not wt["window_alive"]:
-                notes.append("no window")
+                notes.append("[yellow]no window[/yellow]")
             if wt["dirty"]:
-                notes.append("dirty")
+                notes.append("[yellow]dirty[/yellow]")
             groups.append((wt["worktree"], wt["branch"], wt["panes"],
                            " · ".join(notes), wt["worktree"]))
         for window, branch, panes, note, wt_name in groups:
             rows.append(Row(
                 "worktree",
-                [f"[b]{window}[/b]", f"[dim]{branch or ''}[/dim]", "", "",
-                 f"[yellow]{note or ''}[/yellow]"],
+                [f"[dim]  ├[/dim] [cyan]{window}[/]",
+                 f"[dim]{branch or ''}[/dim]", "", "", note],
                 worktree=wt_name, ws=w["workspace"]))
             for p in panes:
                 st = p.get("status") or ""
-                color = {"working": "yellow", "done": "green"}.get(st, "dim")
+                # The NAME carries the state, not just the state column: the
+                # eye lands on the name first, and a wall of identical names
+                # was what made four workspaces unreadable.
+                color = {"working": "yellow", "done": "green"}.get(st, "")
+                if not p["name"]:
+                    name = "[dim]○ —[/dim]"
+                elif color:
+                    name = f"[{color}]●[/] [{color}]{p['name']}[/]"
+                else:
+                    name = f"[dim]●[/dim] {p['name']}"
                 rows.append(Row(
                     "pane",
-                    [f"  {'●' if p['name'] else '○'} {p['name'] or '-'}",
-                     p["command"],
-                     f"[{color}]{st}[/{color}]",
-                     age_since(p.get("status_at")),
+                    [f"[dim]  │  [/dim] {name}",
+                     f"[dim]{p['command']}[/dim]",
+                     f"[{color or 'dim'}]{st}[/]",
+                     f"[dim]{age_since(p.get('status_at'))}[/dim]",
                      f"[dim]{p['parent'] + ' ←' if p.get('parent') else ''} {p['pane']}[/dim]"],
                     agent=p["name"], ws=w["workspace"],
                     target=f"{session}:{window}.{p['pane']}" if alive else None,
                     status=st))
 
-    scheds, serr = orq_json("schedule", "ls", "--json")
+    return rows, None
+
+
+def collect_schedules():
+    """Schedules get their own table, with their own columns.
+
+    A pane is something you WATCH; a schedule is something you AUDIT. The
+    questions are different -- is it healthy, when does it fire, what does it
+    do, why did it fail -- and forcing both into one grid is what produced
+    both the truncated columns and the hierarchy nobody could read.
+    """
+    scheds, err = orq_json("schedule", "ls", "--json")
+    rows = []
     for s in (scheds or []):
+        res = s.get("result") or "-"
+        failed = res not in ("ok", "-")
+        never = res == "-"
+        # A failing schedule has to be impossible to miss: the NAME goes red,
+        # not just a cell at the far right.
+        name = (f"[bold red]⏱ {s['name']}[/]" if failed
+                else f"[green]⏱ {s['name']}[/]" if res == "ok"
+                else f"[dim]⏱ {s['name']}[/dim]")
+        nxt = until(s.get("next"))
+        nxt_c = "bold yellow" if nxt in ("now", "overdue") else "dim"
+        result = ("[bold red]failed[/]" if failed
+                  else "[green]ok[/]" if res == "ok" else "[dim]never ran[/dim]")
+        # Three columns, and the third is EMPTY unless something is wrong.
+        # The glance question is "is any of these broken?" -- `never ran`
+        # repeated down a column answers nothing and costs attention.
+        health = "[bold red]✗ failed[/]" if failed else ""
         rows.append(Row(
             "schedule",
-            [f"  ⏱ {s['name']}", when_short(s.get("next")), "", "",
-             f"[dim]{(s.get('desc') or sched_cmd(s.get('exec')))[:60]}[/dim]"],
-            schedule=s["name"]))
-    return rows, serr
+            [name, f"[{nxt_c}]{nxt}[/]", health],
+            schedule=s["name"], status=res, detail=s))
+    return rows, err
 
 
 # --- confirmation ------------------------------------------------------------
@@ -210,16 +311,21 @@ class OrqDash(App):
     CSS = """
     Screen { layout: vertical; }
     #body { height: 1fr; }
-    #left { width: 3fr; }
-    #right { width: 2fr; border-left: solid $panel; }
+    #left { width: 5fr; }
+    #right { width: 4fr; border-left: solid $panel; }
     #preview { padding: 0 1; }
     #preview-title { background: $panel; padding: 0 1; }
+    #legend { padding: 0 1; color: $text-muted; background: $panel; }
+    /* The schedules pane is short on purpose: there are few of them, and the
+       agents tree is what grows. */
+    #sched-title { padding: 0 1; background: $panel; color: $text-muted; }
+    #scheds { height: 9; }
     #filter { display: none; dock: bottom; }
     #filter.on { display: block; }
     #status { dock: bottom; height: 1; padding: 0 1; color: $text-muted; }
     #confirm-box {
         width: 60; height: auto; padding: 1 2;
-        background: $surface; border: thick $warning; align: center middle;
+        background: $surface; border: thick yellow; align: center middle;
     }
     Confirm { align: center middle; }
     DataTable { height: 1fr; }
@@ -237,6 +343,8 @@ class OrqDash(App):
         Binding("escape", "clear_filter", "clear filter", show=False),
         Binding("r", "refresh", "refresh"),
         Binding("t", "theme", "dark/light"),
+        Binding("tab", "next_table", "agents/schedules"),
+        Binding("l", "sched_log", "job log"),
     ]
 
     filter_text = reactive("")
@@ -245,13 +353,30 @@ class OrqDash(App):
         super().__init__()
         self.ws = ws
         self.rows: list[Row] = []
+        # Initialised here, not only in apply(): the focus event fires before
+        # the first load and reached `current` with the attribute missing.
+        self.shown: list[Row] = []
+        self.sched_rows: list[Row] = []
+        self.sched_shown: list[Row] = []
         self.err = None
+        # Which schedule the user explicitly asked the log for. Without this
+        # the 2s refresh redrew the card over the log a moment after `l`, so
+        # the log flashed and vanished.
+        self.log_for = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Horizontal(id="body"):
             with Vertical(id="left"):
+                # The legend answers the question the table kept raising --
+                # what IS each of these lines -- without a manual.
+                yield Static(
+                    "[b]▌[/b] workspace   ├ worktree   ● agent   ○ free pane"
+                    "        [dim]tab switches to schedules[/dim]",
+                    id="legend")
                 yield DataTable(id="table", cursor_type="row", zebra_stripes=False)
+                yield Static("", id="sched-title")
+                yield DataTable(id="scheds", cursor_type="row", zebra_stripes=False)
             with Vertical(id="right"):
                 yield Label("preview", id="preview-title")
                 yield Static("", id="preview")
@@ -270,9 +395,21 @@ class OrqDash(App):
         self.title = "orq"
         self.sub_title = self.ws or "all workspaces"
         t = self.query_one("#table", DataTable)
-        for col, width in (("name", 26), ("process", 12), ("state", 9),
-                           ("age", 6), ("detail", 40)):
+        # Fixed widths added up to more than the pane, so `detail` was cut and
+        # the table grew a horizontal scrollbar. The last column takes what is
+        # left instead.
+        for col, width in (("name", 26), ("process", 11), ("state", 8),
+                           ("age", 4)):
             t.add_column(col, width=width)
+        # No width: the last column takes whatever is left, instead of a fixed
+        # 40 that overflowed the pane and grew a horizontal scrollbar.
+        t.add_column("detail")
+
+        # Its own columns, because a schedule answers different questions.
+        sc = self.query_one("#scheds", DataTable)
+        for col, width in (("schedule", 26), ("next", 11)):
+            sc.add_column(col, width=width)
+        sc.add_column("")
         # Without this the arrow keys never reach the table and nothing moves.
         t.focus()
         self.first_load = True
@@ -284,7 +421,26 @@ class OrqDash(App):
     @work(thread=True, exclusive=True)
     def reload(self):
         rows, err = collect(self.ws)
-        self.call_from_thread(self.apply, rows, err)
+        sched, serr = collect_schedules()
+        self.call_from_thread(self.apply, rows, err or serr)
+        self.call_from_thread(self.apply_scheds, sched, serr)
+
+    def apply_scheds(self, rows, err):
+        self.sched_rows = rows
+        sc = self.query_one("#scheds", DataTable)
+        keep = sc.cursor_row
+        sc.clear()
+        needle = self.filter_text.lower()
+        self.sched_shown = [r for r in rows
+                            if not needle or needle in r.label.lower()]
+        for r in self.sched_shown:
+            sc.add_row(*r.cells)
+        if sc.row_count:
+            sc.move_cursor(row=min(keep or 0, sc.row_count - 1))
+        failing = sum(1 for r in rows if r.status not in ("ok", "-"))
+        alert = f" · [bold red]{failing} failing[/]" if failing else ""
+        self.query_one("#sched-title", Static).update(
+            f"[bold cyan]▌ schedules[/]  [dim]{len(rows)} timer(s)[/dim]{alert}")
 
     def apply(self, rows, err):
         self.rows, self.err = rows, err
@@ -294,6 +450,8 @@ class OrqDash(App):
         # NOT `self.visible`: DOMNode already owns that name, with a setter
         # that validates against a set of visibility values.
         self.shown: list[Row] = []
+        self.sched_rows: list[Row] = []
+        self.sched_shown: list[Row] = []
         needle = self.filter_text.lower()
         for r in rows:
             if needle and needle not in r.label.lower():
@@ -326,6 +484,14 @@ class OrqDash(App):
 
     @property
     def current(self):
+        """Whichever table has focus owns the selection, so every action reads
+        the right thing without a mode to remember."""
+        if self.focused is not None and self.focused.id == "scheds":
+            sc = self.query_one("#scheds", DataTable)
+            if self.sched_shown and sc.cursor_row is not None \
+                    and 0 <= sc.cursor_row < len(self.sched_shown):
+                return self.sched_shown[sc.cursor_row]
+            return None
         t = self.query_one("#table", DataTable)
         if not self.shown or t.cursor_row is None:
             return None
@@ -336,6 +502,17 @@ class OrqDash(App):
     # --- preview: the biggest win. Look at an agent without leaving. ---
 
     def on_data_table_row_highlighted(self, _):
+        # Drop back to the card only when the selection really MOVED. The 2s
+        # refresh restores the cursor, which fires this event too -- clearing
+        # unconditionally made the log revert to the card a moment after `l`.
+        row = self.current
+        if not row or row.kind != "schedule" or row.schedule != self.log_for:
+            self.log_for = None
+        self.refresh_preview()
+
+    def on_descendant_focus(self, _):
+        # Focus decides which table owns the selection, so the preview has to
+        # follow the focus and not only the cursor.
         self.refresh_preview()
 
     def on_data_table_row_selected(self, _):
@@ -346,19 +523,65 @@ class OrqDash(App):
         self.action_switch()
 
     def refresh_preview(self):
+        """A pane previews its SCREEN; a schedule previews its LAST RUN'S LOG.
+
+        They are the same question -- what is this thing doing / what did it
+        do -- and until `orq schedule log` existed there was nowhere at all to
+        answer it for a schedule: the exit code says something broke and
+        nothing says what.
+        """
         row = self.current
         title = self.query_one("#preview-title", Label)
         body = self.query_one("#preview", Static)
-        if row is None or row.kind != "pane" or not row.agent:
+        if row is None:
             title.update("preview")
-            body.update("[dim]select an agent to see its pane[/dim]")
-            return
-        title.update(f"preview · {row.agent}")
-        self.load_preview(row.agent)
+            body.update("[dim]select an agent or a schedule[/dim]")
+        elif row.kind == "pane" and row.agent:
+            title.update(f"preview · {row.agent}")
+            self.load_preview("read", row.agent)
+        elif row.kind == "schedule" and self.log_for == row.schedule:
+            title.update(f"log · {row.schedule}")
+            self.load_preview("schedule-log", row.schedule)
+        elif row.kind == "schedule":
+            # A CARD, not the journal. Filling the screen with logs on every
+            # selection is the opposite of glanceable: you look, you see
+            # whether anything is wrong, and only then you dig -- `l` opens
+            # the log when you actually want it.
+            title.update(f"schedule · {row.schedule}")
+            body.update(self.sched_card(row))
+        else:
+            title.update("preview")
+            body.update("[dim]select an agent or a schedule[/dim]")
+
+    def sched_card(self, row):
+        d = row.detail or {}
+        res = d.get("result") or "-"
+        health = ("[bold red]last run FAILED[/]" if res not in ("ok", "-")
+                  else "[green]last run ok[/]" if res == "ok"
+                  else "[dim]has never run[/dim]")
+        lines = [
+            d.get("desc") or "[dim]no description[/dim]",
+            "",
+            health,
+            f"[dim]next[/dim]     {until(d.get('next'))}  "
+            f"[dim]({when_short(d.get('next'))})[/dim]",
+            f"[dim]last[/dim]     {ago(d.get('last'))}",
+            f"[dim]when[/dim]     {d.get('calendar') or '?'}",
+            f"[dim]by[/dim]       {d.get('creator') or '?'}",
+            "",
+            f"[dim]{sched_cmd(d.get('exec'))}[/dim]",
+        ]
+        if res not in ("ok", "-"):
+            lines += ["", "[dim]press[/dim] [b]l[/b] [dim]for the log[/dim]"]
+        return "\n".join(lines)
 
     @work(thread=True, exclusive=True, group="preview")
-    def load_preview(self, name):
-        code, out, err = orq("read", name, "--lines", str(PREVIEW_LINES))
+    def load_preview(self, kind, name):
+        if kind == "read":
+            code, out, err = orq("read", name, "--lines", str(PREVIEW_LINES))
+        else:
+            code, out, err = orq("schedule", "log", name,
+                                 "--lines", str(PREVIEW_LINES))
         text = out.rstrip() if code == 0 else f"[red]{err}[/red]"
         self.call_from_thread(
             lambda: self.query_one("#preview", Static).update(text))
@@ -384,6 +607,19 @@ class OrqDash(App):
             self.set_status(f"[red]{p.stderr.strip()}[/red]")
         else:
             self.set_status(f"[green]→ {row.target}[/green]")
+
+    def action_sched_log(self):
+        row = self.current
+        if not row or row.kind != "schedule":
+            return
+        # Toggle: `l` again goes back to the card.
+        self.log_for = None if self.log_for == row.schedule else row.schedule
+        self.refresh_preview()
+
+    def action_next_table(self):
+        target = "#table" if (self.focused and self.focused.id == "scheds") else "#scheds"
+        self.query_one(target, DataTable).focus()
+        self.refresh_preview()
 
     def action_theme(self):
         self.theme = THEMES[1] if self.theme == THEMES[0] else THEMES[0]
