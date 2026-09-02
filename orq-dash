@@ -21,6 +21,8 @@ would undo it.
 
 import json
 import subprocess
+
+from rich.markup import escape
 from datetime import datetime, timezone
 
 from textual import work
@@ -41,17 +43,21 @@ PREVIEW_LINES = 60
 # command palette and one more way the status colours drift from what they
 # were designed against. Both are defined here rather than picked from the
 # built-ins, so the two read as the same product.
+# ⚠️ No `background`, `surface` or `foreground`: those are left to the
+# TERMINAL. Painting our own meant a light terminal got a dark rectangle
+# stamped on it (and the reverse), which is exactly the "app that ignores
+# where it is running" look. Only the accents are ours -- they are what makes
+# the two read as the same product -- and the CSS keeps every container
+# transparent so the terminal's own background shows through.
 ORQ_LIGHT = Theme(
     name="orq-light", dark=False,
-    background="#f7f8fa", surface="#ffffff", panel="#eceff4",
-    foreground="#1f2430", primary="#3b5bdb", secondary="#7048e8",
-    accent="#0c8599", success="#2f9e44", warning="#e8590c", error="#e03131",
+    primary="#3b5bdb", secondary="#7048e8", accent="#0c8599",
+    success="#2f9e44", warning="#e8590c", error="#e03131",
 )
 ORQ_DARK = Theme(
     name="orq-dark", dark=True,
-    background="#0f1117", surface="#161922", panel="#1e2230",
-    foreground="#c8d0e0", primary="#7aa2f7", secondary="#bb9af7",
-    accent="#7dcfff", success="#9ece6a", warning="#e0af68", error="#f7768e",
+    primary="#7aa2f7", secondary="#bb9af7", accent="#7dcfff",
+    success="#9ece6a", warning="#e0af68", error="#f7768e",
 )
 # Light first: it is what he works in.
 THEMES = ("orq-light", "orq-dark")
@@ -324,15 +330,17 @@ class Confirm(ModalScreen[bool]):
 
 class OrqDash(App):
     CSS = """
-    Screen { layout: vertical; background: $background; }
+    Screen { layout: vertical; background: transparent; }
+    Header, Footer, Tabs, TabbedContent, TabPane, ContentSwitcher,
+    Horizontal, Vertical { background: transparent; }
     #body { height: 1fr; padding: 0 1; }
 
     /* Rounded panels with titles instead of bare tables butted against each
        other -- the flat grid is what made this read as a terminal dump. */
-    #left  { width: 5fr; }
+    #left  { width: 1fr; }
     #right {
-        width: 4fr; margin-left: 1;
-        border: round $primary 40%; background: $surface;
+        width: 1fr; margin-left: 1;
+        border: round $primary 40%; background: transparent;
     }
     #right.hidden { display: none; }
 
@@ -340,12 +348,12 @@ class OrqDash(App):
     TabPane { padding: 0; }
 
     DataTable {
-        height: 1fr; background: $surface;
+        height: 1fr; background: transparent;
         border: round $primary 40%; padding: 0 1;
         scrollbar-size: 1 1;
     }
     DataTable > .datatable--header {
-        background: $surface; color: $text-muted; text-style: none;
+        background: transparent; color: $text-muted; text-style: none;
     }
     DataTable > .datatable--cursor { background: $primary 25%; }
 
@@ -355,7 +363,7 @@ class OrqDash(App):
        reads like a dialog widget dropped into a status bar. */
     #preview-toggle {
         min-width: 8; width: auto; height: 1; padding: 0 1;
-        border: none; background: $panel; color: $text-muted;
+        border: none; background: $primary 20%; color: $text-muted;
     }
     #preview-toggle:hover { background: $primary 30%; color: $text; }
     #preview { padding: 0 1; }
@@ -366,6 +374,7 @@ class OrqDash(App):
     #filter.on { display: block; }
     #status { dock: bottom; height: 1; padding: 0 2; color: $text-muted; }
 
+    /* The modal DOES paint: it has to cover what is under it. */
     #confirm-box {
         width: 64; height: auto; padding: 1 2;
         background: $surface; border: round $warning;
@@ -376,7 +385,10 @@ class OrqDash(App):
     BINDINGS = [
         Binding("q", "quit", "quit"),
         Binding("enter", "switch", "open pane"),
-        Binding("k", "kill", "kill agent"),
+        # "kill pane" is what it does -- the pane dies and the registry entry
+        # goes with it. It still only accepts a REGISTERED agent, so a free
+        # pane says so instead of silently doing nothing.
+        Binding("k", "kill", "kill pane"),
         Binding("d", "wt_rm", "rm worktree"),
         Binding("x", "sched_rm", "rm schedule"),
         Binding("f", "sched_run", "fire schedule"),
@@ -453,7 +465,7 @@ class OrqDash(App):
         # Fixed widths added up to more than the pane, so `detail` was cut and
         # the table grew a horizontal scrollbar. The last column takes what is
         # left instead.
-        for col, width in (("name", 24), ("process", 10), ("state", 7),
+        for col, width in (("name", 22), ("process", 9), ("state", 7),
                            ("age", 4)):
             t.add_column(col, width=width)
         # No width: the last column takes whatever is left, instead of a fixed
@@ -616,6 +628,10 @@ class OrqDash(App):
         health = ("[bold red]last run FAILED[/]" if res not in ("ok", "-")
                   else "[green]last run ok[/]" if res == "ok"
                   else "[dim]has never run[/dim]")
+        # The command is the thing you actually want to read when judging a
+        # schedule -- it is what will run, unattended, with nobody watching --
+        # so it gets a label and the full text instead of a dim tail.
+        cmd = sched_cmd(d.get("exec")) or "?"
         lines = [
             d.get("desc") or "[dim]no description[/dim]",
             "",
@@ -626,7 +642,8 @@ class OrqDash(App):
             f"[dim]when[/dim]     {d.get('calendar') or '?'}",
             f"[dim]by[/dim]       {d.get('creator') or '?'}",
             "",
-            f"[dim]{sched_cmd(d.get('exec'))}[/dim]",
+            "[dim]command[/dim]",
+            f"[$accent]{escape(cmd)}[/]",
         ]
         if res not in ("ok", "-"):
             lines += ["", "[dim]press[/dim] [b]l[/b] [dim]for the log[/dim]"]
@@ -719,12 +736,19 @@ class OrqDash(App):
 
     def action_kill(self):
         row = self.current
-        if not row or row.kind != "pane" or not row.agent:
+        if not row or row.kind != "pane":
+            return
+        if not row.agent:
+            self.set_status("[yellow]that pane is not registered — "
+                            "orq only kills named agents[/yellow]")
             return
         def go(yes):
             if yes:
                 self.run_and_report("kill", row.agent, ok=f"{row.agent} killed")
-        self.push_screen(Confirm(f"kill agent '{row.agent}'?"), go)
+        self.push_screen(
+            Confirm(f"kill '{row.agent}'?\n"
+                    f"the pane dies and the registry entry goes with it. "
+                    f"the worktree and its branch are untouched."), go)
 
     def action_wt_rm(self):
         row = self.current
