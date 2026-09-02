@@ -117,11 +117,14 @@ def set_palette(dark):
     if dark:
         PAL.update({"struct": "#748ffc", "work": "#ffd43b", "ok": "#69db7c",
                     "bad": "#ff8787", "warn": "#ffd43b", "sched": "#b197fc",
-                    "muted": "#7d8598", "faint": "#4b5262"})
+                    "muted": "#7d8598", "faint": "#4b5262",
+                    # the surface the preview paints on, for contrast checks
+                    "bg_rgb": (24, 27, 37)})
     else:
         PAL.update({"struct": "#4263eb", "work": "#e8590c", "ok": "#2f9e44",
                     "bad": "#e03131", "warn": "#e8590c", "sched": "#7950f2",
-                    "muted": "#7b8296", "faint": "#c2c7d2"})
+                    "muted": "#7b8296", "faint": "#c2c7d2",
+                    "bg_rgb": (244, 245, 248)})
 
 
 set_palette(dark=False)
@@ -260,17 +263,43 @@ def pane_screen(target, keep=None):
     return out
 
 
-def foreground_only(style):
-    """Keep the colour, drop the background and the inversion.
+def _luminance(rgb):
+    def chan(v):
+        v = v / 255
+        return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+    r, g, b = (chan(c) for c in rgb)
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
 
-    A pane's background colours are chosen against ITS background, not ours.
-    Rendered over a different surface they arrive as grey slabs behind random
-    lines -- Claude Code tints its own prompt lines, and those tints came
-    through as highlighting that does not exist when you look at the pane
-    directly. Foreground survives because that is the part that still means
-    the same thing anywhere.
+
+def _contrast(rgb_a, rgb_b):
+    la, lb = _luminance(rgb_a), _luminance(rgb_b)
+    hi, lo = max(la, lb), min(la, lb)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def foreground_only(style):
+    """Keep the colour, drop the background -- unless dropping it would make
+    the text unreadable.
+
+    A pane's background is chosen against ITS background, not ours, so it
+    arrives as grey slabs behind random lines. But some text is only legible
+    BECAUSE of its background: Claude Code writes the user's own messages as
+    pale text on a dark tint, and stripping the tint left white on white.
+
+    So the colour is kept only while it still contrasts with the surface we
+    are painting on. Below the threshold it is dropped entirely and the theme's
+    foreground takes over -- losing the hue, which carries little, rather than
+    the words, which carry everything.
     """
-    return Style(color=style.color, bold=style.bold, italic=style.italic,
+    color = style.color
+    if color is not None:
+        try:
+            rgb = color.get_truecolor()
+            if _contrast((rgb.red, rgb.green, rgb.blue), PAL["bg_rgb"]) < 2.5:
+                color = None
+        except Exception:
+            pass
+    return Style(color=color, bold=style.bold, italic=style.italic,
                  dim=style.dim, underline=style.underline,
                  strike=style.strike)
 
