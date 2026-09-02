@@ -28,3 +28,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ```
 
 Requires `tmux`, `git`, `systemd --user` and `python3`.
+
+## License
+
+MIT
