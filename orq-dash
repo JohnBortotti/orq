@@ -468,8 +468,8 @@ class OrqDash(App):
         # pane says so instead of silently doing nothing.
         Binding("k", "kill", "kill pane"),
         Binding("d", "wt_rm", "rm worktree"),
-        Binding("x", "sched_rm", "rm schedule"),
-        Binding("f", "sched_run", "fire schedule"),
+        Binding("x", "sched_rm", "remove"),
+        Binding("f", "sched_run", "run now"),
         Binding("R", "resurrect", "resurrect"),
         Binding("slash", "filter", "filter"),
         Binding("escape", "clear_filter", "clear filter", show=False),
@@ -479,7 +479,7 @@ class OrqDash(App):
         # binding before it ever reaches the app.
         Binding("1", "tab_ws", "workspaces"),
         Binding("2", "tab_sched", "schedules"),
-        Binding("l", "sched_log", "job log"),
+        Binding("l", "sched_log", "log"),
         Binding("p", "toggle_preview", "preview"),
         Binding("i", "prompt", "send prompt"),
     ]
@@ -804,6 +804,28 @@ class OrqDash(App):
         which = "#scheds" if tabs.active == "tab-sched" else "#table"
         return self.query_one(which, DataTable)
 
+    # Actions that only make sense on one tab. `check_action` both hides them
+    # from the footer AND disables the key, so this is not decoration: `x` on
+    # the workspaces tab no longer half-works on a schedule you cannot see.
+    WS_ONLY = {"switch", "kill", "wt_rm", "prompt", "resurrect"}
+    SCHED_ONLY = {"sched_rm", "sched_run", "sched_log"}
+
+    def check_action(self, action, parameters):
+        try:
+            on_sched = self.query_one("#tabs", TabbedContent).active == "tab-sched"
+        except Exception:
+            return True
+        if action in self.WS_ONLY:
+            return not on_sched
+        if action in self.SCHED_ONLY:
+            return on_sched
+        # The key for the tab you are already on is dead weight in the footer.
+        if action == "tab_ws":
+            return on_sched
+        if action == "tab_sched":
+            return not on_sched
+        return True
+
     def action_tab_ws(self):
         self.query_one("#tabs", TabbedContent).active = "tab-ws"
 
@@ -814,6 +836,9 @@ class OrqDash(App):
         self.log_for = None
         self.active_table.focus()
         self.refresh_preview()
+        # Without this the footer keeps showing the old tab's keys until
+        # something else happens to redraw it.
+        self.refresh_bindings()
 
     def action_theme(self):
         self.theme = THEMES[1] if self.theme == THEMES[0] else THEMES[0]
