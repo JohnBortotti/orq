@@ -6,9 +6,6 @@ A thin CLI: each subcommand is one or two calls to tmux, git or systemd with a
 decent name. The orchestration -- the graph, the order, who does what -- does
 not live here; it lives in the skill and in the prompt.
 
-**The plan is the source of truth**, and it lives outside this repo:
-`notes/projects/orq/index.md` in the vault.
-
 ## Layout
 
 | file | what it is |

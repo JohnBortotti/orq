@@ -1,4 +1,4 @@
-#!/home/joao/workspace/orq/.venv/bin/python
+#!/usr/bin/env python3
 """orq-dash -- a Textual dashboard over `orq`.
 
 A SEPARATE program on purpose. It talks to orq only through the CLI contract
@@ -29,14 +29,28 @@ from rich.style import Style
 from rich.text import Text
 from datetime import datetime, timezone
 
-from textual import work
-from textual.app import App, ComposeResult
-from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
-from textual.message import Message
-from textual.reactive import reactive
-from textual.screen import ModalScreen
-from textual.theme import Theme
+try:
+    from textual import work
+    from textual.app import App, ComposeResult
+    from textual.binding import Binding
+    from textual.containers import Horizontal, Vertical
+    from textual.message import Message
+    from textual.reactive import reactive
+    from textual.screen import ModalScreen
+    from textual.theme import Theme
+except ImportError:
+    # Caught here, not by the caller: `orq dash` execs a working interpreter,
+    # so the exec succeeds and the failure happens in this file, at import.
+    # A raw ModuleNotFoundError reads as a broken repo on a first clone.
+    import pathlib as _p
+    import sys as _sys
+    _root = _p.Path(__file__).resolve().parent
+    _sys.exit(
+        "orq-dash needs its dependencies, and they are not installed.\n"
+        f"  cd {_root} && python3 -m venv .venv "
+        f"&& .venv/bin/pip install -r requirements.txt\n"
+        "  (only the dashboard needs them; the orq CLI itself does not)"
+    )
 from textual.widgets import (Button, DataTable, Footer, Header, Input,
                              Label, Static, TabbedContent, TabPane, TextArea)
 

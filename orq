@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """orq -- an agent orchestrator over tmux, git worktree and systemd.
 
-Single file. The full plan lives in the vault, at `notes/projects/orq/index.md`;
-this file is the surface that plan describes. All orchestration -- the graph,
-the order, who does what -- lives in the skill and in the prompt, never here.
+Single file, no build, readable in an afternoon. All orchestration -- the
+graph, the order, who does what -- lives in the skill and in the prompt, never
+here.
 """
 
 import argparse
@@ -1694,18 +1694,25 @@ def cmd_dash(args):
     a path, not an import: if the dashboard is missing or its venv is not set
     up, this says so instead of pretending the command does not exist.
     """
-    sibling = Path(sys.argv[0]).resolve().parent / "orq-dash"
+    here = Path(sys.argv[0]).resolve().parent
+    sibling = here / "orq-dash"
     if not sibling.exists():
         raise OrqError(
             f"dashboard not installed: {sibling} is missing.\n"
             f"  it is a separate program; see requirements.txt"
         )
+    # The interpreter is found HERE, at run time, instead of being baked into
+    # the dashboard's shebang. An absolute shebang only holds on the machine
+    # and in the directory it was written for: move the repo, or clone it
+    # anywhere else, and the file reports itself as a bad interpreter.
+    venv = here / ".venv/bin/python"
+    python = str(venv) if venv.exists() else sys.executable
     rest = []
     ws = ws_arg(args)
     if ws:
         rest = ["--ws", ws]
     try:
-        os.execv(str(sibling), [str(sibling), *rest])
+        os.execv(python, [python, str(sibling), *rest])
     except OSError as e:
         raise OrqError(
             f"could not start {sibling}: {e}\n"
