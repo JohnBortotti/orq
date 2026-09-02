@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""orq — orquestrador de agentes sobre tmux, git worktree e systemd.
+"""orq -- an agent orchestrator over tmux, git worktree and systemd.
 
-Arquivo unico. O plano completo vive no vault, em `notes/projects/orq/index.md`;
-este arquivo e' a superficie que ele descreve. Toda orquestracao — grafo, ordem,
-quem faz o que — mora na skill e no prompt, nunca aqui.
+Single file. The full plan lives in the vault, at `notes/projects/orq/index.md`;
+this file is the surface that plan describes. All orchestration -- the graph,
+the order, who does what -- lives in the skill and in the prompt, never here.
 """
 
 import argparse
 import fcntl
 import json
 import os
+import curses
 import re
 import shlex
 import shutil
@@ -22,10 +23,11 @@ from pathlib import Path
 
 import yaml
 
-# --- constantes fixadas pelo plano -----------------------------------------
+# --- constants fixed by the plan --------------------------------------------
 
-# Detalhe #2: o socket e' `-L orq` em TODOS os comandos, nunca so no up/attach.
-# Esquecer a flag num subcomando escreve no servidor tmux errado, em silencio.
+# Detail #2: the socket is `-L orq` on EVERY command, not just up/attach.
+# Forgetting the flag on one subcommand lands it on the wrong tmux server,
+# silently.
 SOCKET = "orq"
 
 HOME = Path(os.environ.get("ORQ_HOME", Path.home() / ".orq"))
@@ -36,66 +38,66 @@ STATE = HOME / "state"
 LOG = HOME / "log.jsonl"
 HOOKS = HOME / "hooks"
 
-# Schedules: a UNIDADE e' o registro. Nao ha espelho em ~/.orq/ pra divergir --
-# a unidade se autodescreve e o `schedule ls` le o systemd direto.
+# Schedules: the UNIT is the registry. There is no mirror under ~/.orq/ to
+# drift -- the unit describes itself and `schedule ls` reads systemd directly.
 UNITS = Path(os.environ.get("ORQ_UNITS",
                             Path.home() / ".config/systemd/user"))
 SCHED_PREFIX = "orq-"
-# Teto de quantidade: agente criando job recorrente e' poder de outra natureza
-# -- roda depois, sozinho, com bypass, sem ninguem olhando, e pode criar
-# outros. O caso feio nao e' malicia, e' ACUMULO.
+# Quantity ceiling: an agent creating a recurring job is a different kind of
+# power -- it runs later, alone, with bypass, with nobody watching, and it can
+# create more. The ugly case is not malice, it is ACCUMULATION.
 SCHED_MAX = 32
 
-# Evento do agente -> status no registro. UM comando serve todos: o payload do
-# hook traz `hook_event_name`, entao a tabela mora aqui em vez de virar varias
-# entradas diferentes no settings do provider.
+# Agent event -> status in the registry. ONE command serves them all: the hook
+# payload carries `hook_event_name`, so the table lives here instead of turning
+# into several different entries in the provider's settings.
 #
-# ❌ `waiting` foi CORTADO em 01/09/2026, depois de medido. O `Notification` do
-# Claude Code dispara 60s DEPOIS do Stop, com message="Claude is waiting for
-# your input" -- ou seja, `waiting` era `done` mais um minuto, sem nenhuma
-# informacao nova sobre o agente. Pior: sobrescrevia o `done`, e a partir dai o
-# `ls` nao distinguia mais quem TERMINOU de quem foi spawnado e nunca produziu
-# nada. No workmux `waiting` significa "precisa do humano" (pergunta ou
-# permissao pendente); com --dangerously-skip-permissions esse caso nao existe
-# aqui, entao o estado degenerou em cronometro. Dois estados que o agente
-# realmente distingue valem mais que tres em que um mente.
+# `waiting` was CUT on 2026-09-01, after measuring. Claude Code's `Notification`
+# fires 60s AFTER Stop, with message="Claude is waiting for your input" -- that
+# is, `waiting` was `done` plus a minute, carrying no new information about the
+# agent. Worse: it overwrote `done`, and from then on `ls` could no longer tell
+# who had FINISHED from who was spawned and never produced anything. In workmux
+# `waiting` means "needs the human" (a pending question or permission); with
+# --dangerously-skip-permissions that case does not exist here, so the state
+# degenerated into a stopwatch. Two states the agent really distinguishes beat
+# three where one of them lies.
 HOOK_STATUS = {
     "UserPromptSubmit": "working",
     "Stop": "done",
 }
-# schedules NAO moram aqui: a unidade systemd e' a unica fonte de verdade.
+# schedules do NOT live here: the systemd unit is the only source of truth.
 
-# Detalhe #5: `:` e `.` sao separadores de alvo do tmux (sessao:janela.pane),
-# entao nenhum dos dois entra em nome de workspace, worktree ou agente -- um
-# nome com ponto viraria alvo ambiguo em todo `-t` do codigo.
-# ⚠️ Decidido assim em 01/09/2026, resolvendo uma contradicao do plano (a classe
-# original incluia `.`, a prosa ao lado o proibia). O custo e' cosmetico e
-# conhecido: repo com ponto no nome (`docs.site`, `api.v2`) vira `docs-site`,
-# `api-v2`. Isto PRECISA estar no SKILL.md, senao um agente tenta `api.v2` e
-# leva erro sem entender por que.
+# Detail #5: `:` and `.` are tmux target separators (session:window.pane), so
+# neither is allowed in a workspace, worktree or agent name -- a name with a dot
+# would become an ambiguous target in every `-t` in this file.
+# Decided this way on 2026-09-01, settling a contradiction in the plan (the
+# original character class included `.`, the prose beside it forbade it). The
+# cost is cosmetic and known: a repo with a dot in its name (`docs.site`,
+# `api.v2`) becomes `docs-site`, `api-v2`. This MUST be in SKILL.md, otherwise
+# an agent tries `api.v2` and gets an error it cannot explain.
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_/-]*$")
 
-# Janela que nasce junto com a sessao, no `root:` do workspace. Nao e' worktree:
-# e' onde mora o agente de NIVEL DE WORKSPACE — o orquestrador, que trabalha um
-# nivel acima dos repos. Ele precisa nascer de um `spawn` como qualquer outro,
-# senao nao esta no registro e o `done` dos workers nao tem pra quem mandar.
-# Prefixo `_` pra nunca colidir com <repo>/<slug>.
+# The window born with the session, at the workspace's `root:`. Not a worktree:
+# it is where the WORKSPACE-LEVEL agent lives -- the orchestrator, which works
+# one level above the repos. It has to be born from a `spawn` like any other,
+# otherwise it is not in the registry and the workers' `done` has nobody to
+# notify. The `_` prefix keeps it from ever colliding with <repo>/<slug>.
 LEAD_WINDOW = "_lead"
 
-# Shells parados: um pane rodando um destes esta "livre" pro spawn tomar.
+# Idle shells: a pane running one of these is "free" for spawn to take over.
 SHELLS = {"bash", "zsh", "fish", "sh", "dash", "ksh"}
 
-# Armadilha 5: o prompt so pode ser mandado depois que o agente subiu, senao
-# cai no shell. Poll de pane_current_command ate virar o provider.
+# Pitfall 5: the prompt can only be sent after the agent is up, otherwise it
+# lands in the shell. See wait_for_ready -- readiness is data, not code.
 BOOT_TIMEOUT_S = 30
 BOOT_POLL_S = 0.25
 
 
 class OrqError(Exception):
-    """Erro esperado: vira mensagem e exit 1, sem traceback."""
+    """An expected error: becomes a message and exit 1, with no traceback."""
 
 
-# --- infra: processo --------------------------------------------------------
+# --- infra: process ---------------------------------------------------------
 
 def run(cmd, cwd=None, check=True, capture=True):
     p = subprocess.run(
@@ -110,7 +112,7 @@ def run(cmd, cwd=None, check=True, capture=True):
 
 
 def tmux(*args, check=True, capture=True):
-    """Toda chamada de tmux passa por aqui — e' o que garante o `-L orq`."""
+    """Every tmux call goes through here -- that is what guarantees `-L orq`."""
     return run(["tmux", "-L", SOCKET, *args], check=check, capture=capture)
 
 
@@ -122,15 +124,15 @@ def git(cwd, *args, check=True):
 
 def load_yaml(path, what):
     if not path.exists():
-        raise OrqError(f"{what} nao existe: {path}")
+        raise OrqError(f"{what} does not exist: {path}")
     with open(path) as f:
         return yaml.safe_load(f) or {}
 
 
 def workspace_config(ws):
     if not NAME_RE.match(ws):
-        raise OrqError(f"nome de workspace invalido: '{ws}' (esperado {NAME_RE.pattern})")
-    # Detalhe #7: workspace inexistente e' erro, nunca cria arquivo de config.
+        raise OrqError(f"invalid workspace name: '{ws}' (expected {NAME_RE.pattern})")
+    # Detail #7: a missing workspace is an error; never create a config file.
     return load_yaml(WORKSPACES / f"{ws}.yml", f"workspace '{ws}'")
 
 
@@ -144,7 +146,7 @@ def expand(p):
     return Path(os.path.expanduser(str(p)))
 
 
-# --- infra: registro e log --------------------------------------------------
+# --- infra: registry and log ------------------------------------------------
 
 def ensure_home():
     for d in (HOME, WORKSPACES, STATE):
@@ -164,12 +166,12 @@ def read_state(ws):
 
 
 def update_state(ws, mutate):
-    """Detalhe #4: leitura-modificacao-escrita sob `flock`, com replace atomico.
+    """Detail #4: read-modify-write under `flock`, with an atomic replace.
 
-    O flock protege escritor contra escritor (dois `spawn` simultaneos apagariam
-    um ao outro); o os.replace protege leitor contra escritor (ninguem ve JSON
-    pela metade). A trava sai sozinha quando o fd fecha ou o processo morre —
-    e' por isso que nao existe trava orfa aqui.
+    The flock protects writer against writer (two concurrent `spawn`s would
+    erase each other); os.replace protects reader against writer (nobody sees
+    half a JSON). The lock releases itself when the fd closes or the process
+    dies -- which is why there is no orphan lock here.
     """
     ensure_home()
     f = state_file(ws)
@@ -187,8 +189,8 @@ def update_state(ws, mutate):
 
 
 def log_event(**fields):
-    """Append-only. Nao usa flock: O_APPEND torna a escrita de linha curta
-    atomica no Linux, entao processos concorrentes nao se sobrescrevem."""
+    """Append-only. No flock: O_APPEND makes a short line write atomic on
+    Linux, so concurrent processes do not overwrite each other."""
     ensure_home()
     fields = {"ts": datetime.now(timezone.utc).astimezone().isoformat(), **fields}
     with open(LOG, "a") as f:
@@ -201,49 +203,67 @@ def session_exists(ws):
     return tmux("has-session", "-t", f"={ws}", check=False).returncode == 0
 
 
-def pane_procs(pane_pid):
-    """Comandos que rodam DENTRO do pane: o processo do proprio pane mais os
-    descendentes.
+def proc_table():
+    """The whole process table in a single `ps` call.
 
-    Existe porque `pane_current_command` mente conforme o pane nasceu. Medido
-    em 01/09/2026 com dois Claude identicos na mesma janela: o que TOMOU um
-    shell existente (send-keys) reporta `claude`; o que veio de `split-window`
-    com o comando reporta `bash`, mesmo tendo `claude` como filho em
-    foreground. Isso furava a recusa de "agente vivo" do `wt rm` do segundo
-    agente em diante -- a mesma trava que o `-s` do list-panes ja tinha furado.
+    The first version fired TWO calls per PID walked. Measured with 5 panes:
+    202ms -- and since `dash` rebuilt everything on every keystroke, that is
+    what made it feel stuck."""
+    r = run(["ps", "-eo", "pid=,ppid=,comm="], check=False)
+    children, names = {}, {}
+    for line in r.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) != 3:
+            continue
+        pid, ppid, comm = parts
+        names[pid] = comm
+        children.setdefault(ppid, []).append(pid)
+    return children, names
+
+
+def pane_procs(pane_pid, table=None):
+    """Commands running INSIDE the pane: the pane's own process plus its
+    descendants.
+
+    It exists because `pane_current_command` lies depending on how the pane was
+    born. Measured on 2026-09-01 with two identical Claudes in the same window:
+    the one that TOOK OVER an existing shell (send-keys) reports `claude`; the
+    one born from `split-window` with the command reports `bash`, even with
+    `claude` as its foreground child. That defeated the "live agent" refusal in
+    `wt rm` from the second agent on -- the same guard the missing `-s` on
+    list-panes had already defeated.
     """
     if not pane_pid:
         return []
-    vistos, fila, saida = set(), [str(pane_pid)], []
-    while fila:
-        pid = fila.pop()
-        if pid in vistos:
+    children, names = table if table else proc_table()
+    seen, queue, out = set(), [str(pane_pid)], []
+    while queue:
+        pid = queue.pop()
+        if pid in seen:
             continue
-        vistos.add(pid)
-        r = run(["ps", "-o", "comm=", "-p", pid], check=False)
-        nome = r.stdout.strip()
-        if nome:
-            saida.append(nome)
-        r = run(["ps", "-o", "pid=", "--ppid", pid], check=False)
-        fila.extend(x.strip() for x in r.stdout.split() if x.strip())
-    return saida
+        seen.add(pid)
+        if pid in names:
+            out.append(names[pid])
+        queue.extend(children.get(pid, []))
+    return out
 
 
 def list_panes(ws=None):
-    """Panes vivos no socket do orq, como lista de dicts."""
+    """Panes alive no socket do orq, como lista de dicts."""
     fmt = "\t".join([
         "#{session_name}", "#{window_name}", "#{pane_id}",
         "#{pane_current_command}", "#{pane_current_path}",
         "#{window_activity_flag}", "#{window_silence_flag}", "#{pane_pid}",
     ])
-    # `-s` e' obrigatorio: sem ele, `-t <sessao>` lista so os panes da janela
-    # ATIVA, e nao os da sessao inteira. Isso escondia panes do `ls` e furava
-    # a recusa de "agente vivo" do `wt rm`.
+    # `-s` is mandatory: without it, `-t <session>` lists only the panes of the
+    # ACTIVE window, not the whole session. That hid panes from `ls` and
+    # defeated the "agent alive" refusal in `wt rm`.
     target = ["-s", "-t", f"={ws}"] if ws else ["-a"]
     p = tmux("list-panes", "-F", fmt, *target, check=False)
     if p.returncode != 0:
         return []
     out = []
+    table = proc_table()          # once per listing, not once per pane
     for line in p.stdout.splitlines():
         parts = line.split("\t")
         if len(parts) != 8:
@@ -253,9 +273,10 @@ def list_panes(ws=None):
              "silence", "pid"],
             parts,
         ))
-        # `command` vem do tmux e mente conforme o pane nasceu; `procs` e' a
-        # verdade da arvore. Quem decide algo olha `procs`.
-        d["procs"] = pane_procs(d["pid"])
+        # `command` comes from tmux and lies depending on how the pane was
+        # born; `procs` is the truth from the process tree. Anything that
+        # DECIDES something reads `procs`.
+        d["procs"] = pane_procs(d["pid"], table)
         out.append(d)
     return out
 
@@ -274,8 +295,8 @@ def default_remote_branch(repo_path):
         if git(repo_path, "rev-parse", "--verify", cand, check=False).returncode == 0:
             return cand
     raise OrqError(
-        f"{repo_path}: nao consegui descobrir a branch default do origin. "
-        "Rode `git remote set-head origin -a` no repo."
+        f"{repo_path}: could not determine origin's default branch. "
+        "Run `git remote set-head origin -a` in the repo."
     )
 
 
@@ -285,13 +306,14 @@ def branch_exists(repo_path, branch):
 
 
 def dirty_entries(path, ignore=()):
-    """Sujeira real da arvore, descontando o que o proprio orq colocou la.
+    """Real dirt in the tree, discounting what orq itself put there.
 
-    Sem isso, `files.symlink` deixa o worktree permanentemente sujo: um padrao
-    de .gitignore com barra final (`node_modules/`) casa diretorio, e symlink
-    NAO e' diretorio pro git — o link vira `?? node_modules` pra sempre, e o
-    `wt rm` passaria a recusar todo worktree. O orq nao mente sobre o estado da
-    arvore; ele so nao conta contra o usuario o que ele mesmo criou.
+    Without this, `files.symlink` leaves the worktree permanently dirty: a
+    .gitignore pattern with a trailing slash (`node_modules/`) matches a
+    directory, and a symlink is NOT a directory to git -- the link becomes
+    `?? node_modules` forever, and `wt rm` would start refusing every worktree.
+    orq does not lie about the state of the tree; it just does not count
+    against the user what it put there itself.
     """
     ignore = set(ignore or ())
     out = []
@@ -306,9 +328,9 @@ def dirty_entries(path, ignore=()):
 
 
 def git_worktrees(repo_path):
-    """Paths e branches que o git conhece, do `worktree list --porcelain`.
-    E' a fonte que sobrevive a perda do `~/.orq/state/` — o registro e' indice,
-    nao verdade."""
+    """Paths and branches git knows about, from `worktree list --porcelain`.
+    It is the source that survives losing `~/.orq/state/` -- the registry is an
+    index, not the truth."""
     out, cur = [], {}
     for line in git(repo_path, "worktree", "list", "--porcelain").stdout.splitlines():
         if not line.strip():
@@ -336,30 +358,31 @@ def unpushed_commits(path, branch):
     return [c for c in p.stdout.split() if c] if p.returncode == 0 else []
 
 
-# --- resolucao de alvo ------------------------------------------------------
+# --- target resolution ------------------------------------------------------
 
 def split_target(target):
     if target.count("/") < 1:
-        raise OrqError(f"alvo invalido: '{target}' (esperado <repo>/<slug>)")
+        raise OrqError(f"target invalido: '{target}' (esperado <repo>/<slug>)")
     repo, slug = target.split("/", 1)
     if not NAME_RE.match(target):
-        raise OrqError(f"nome invalido: '{target}' (esperado {NAME_RE.pattern})")
+        raise OrqError(f"invalid name: '{target}' (expected {NAME_RE.pattern})")
     return repo, slug
 
 
 def ws_arg(args):
-    """--ws vence o posicional. Os dois existem em todo comando que aceita
-    workspace; a assimetria antiga (posicional obrigatorio em `up`/`attach`,
-    so `--ws` no resto) custava erro de digitacao a quem le a superficie."""
+    """--ws beats the positional. Both exist on every command that takes a
+    workspace; the old asymmetry (positional required by `up`/`attach`, only
+    `--ws` on the rest) cost typing errors to whoever reads the surface."""
     return getattr(args, "ws", None) or getattr(args, "ws_pos", None)
 
 
 def resolve_ws(explicit):
-    """Workspace explicito, ou inferido da sessao tmux atual quando se esta
-    dentro do socket do orq.
+    """The explicit workspace, or the one inferred from the current tmux
+    session when running inside orq's socket.
 
-    O plano nao dizia como inferir; esta leitura rodou o dia 01/09 inteiro sem
-    atrito e foi confirmada. Precedencia: explicito > inferido da sessao.
+    The plan did not say how to infer it; this reading ran the whole of
+    2026-09-01 without friction and was confirmed. Precedence: explicit over
+    inferred.
     """
     if explicit:
         return explicit
@@ -367,17 +390,17 @@ def resolve_ws(explicit):
         p = tmux("display-message", "-p", "#{session_name}", check=False)
         if p.returncode == 0 and p.stdout.strip():
             return p.stdout.strip()
-    raise OrqError("nao consegui inferir o workspace — passe --ws")
+    raise OrqError("could not infer the workspace -- pass --ws")
 
 
 def repo_path(cfg, repo):
     repos = cfg.get("repos") or {}
     if repo not in repos:
-        conhecidos = ", ".join(sorted(repos)) or "(nenhum)"
-        raise OrqError(f"repo '{repo}' nao esta no workspace. Conhecidos: {conhecidos}")
+        known = ", ".join(sorted(repos)) or "(nenhum)"
+        raise OrqError(f"repo '{repo}' is not in this workspace. Known: {known}")
     path = expand(repos[repo])
     if not (path / ".git").exists():
-        raise OrqError(f"'{repo}' aponta pra {path}, que nao e' um repo git")
+        raise OrqError(f"'{repo}' points at {path}, which is not a git repo")
     return path
 
 
@@ -387,20 +410,20 @@ def worktree_path(cfg, repo, slug):
 
 
 def lead_root(cfg):
-    """Onde nasce o agente de nivel de workspace. Default `~` preserva o
-    comportamento de quem nao declara `root:`."""
+    """Where the workspace-level agent is born. The `~` default preserves the
+    behaviour of a workspace that declares no `root:`."""
     root = expand(cfg.get("root") or "~")
     if not root.is_dir():
-        raise OrqError(f"root '{root}' nao existe ou nao e' diretorio "
-                       f"(chave `root:` do workspace)")
+        raise OrqError(f"root '{root}' does not exist or is not a directory "
+                       f"(the workspace's `root:` key)")
     return root
 
 
 # --- file ops e post_create -------------------------------------------------
 
 def apply_file_ops(cfg, src, dst):
-    """Worktree novo e' checkout limpo: sem .env, sem node_modules, e a app nao
-    sobe. Copy pro que e' por-worktree, symlink pro que e' pesado."""
+    """A new worktree is a clean checkout: no .env, no node_modules, and the app
+    will not start. Copy what is per-worktree, symlink what is heavy."""
     files = (cfg.get("files") or {})
     done = {"copied": [], "linked": []}
     for pattern in files.get("copy") or []:
@@ -424,15 +447,15 @@ def apply_file_ops(cfg, src, dst):
 
 
 def run_post_create(cfg, cwd):
-    """Roda antes de a janela abrir — e' por isso que instalacao pesada
-    (pnpm install) e' melhor num pane: aqui ela bloqueia."""
+    """Runs before the window opens -- which is why a heavy install (pnpm
+    install) is better off in a pane: here it blocks."""
     for cmd in cfg.get("post_create") or []:
         p = run(["bash", "-lc", cmd], cwd=cwd, check=False, capture=False)
         if p.returncode != 0:
-            raise OrqError(f"post_create falhou: {cmd}")
+            raise OrqError(f"post_create failed: {cmd}")
 
 
-# --- agentes: resolucao e registro ------------------------------------------
+# --- agents: resolution and registry ----------------------------------------
 
 def all_pane_ids():
     p = tmux("list-panes", "-a", "-F", "#{pane_id}", check=False)
@@ -440,67 +463,69 @@ def all_pane_ids():
 
 
 def find_agent(name):
-    """Nome -> (workspace, registro). Detalhe #6: pane morto vira nome orfao, e
-    a falha tem que dizer isso, nao 'nao encontrado'."""
+    """Name -> (workspace, registry entry). Detail #6: a dead pane leaves an
+    orphan name, and the failure has to say so, not 'not found'."""
     if not WORKSPACES.exists():
-        raise OrqError(f"'{name}' nao existe")
-    vivos = all_pane_ids()
+        raise OrqError(f"'{name}' does not exist")
+    alive = all_pane_ids()
     for f in sorted(WORKSPACES.glob("*.yml")):
         ws = f.stem
         agents = read_state(ws).get("agents") or {}
         if name in agents:
             reg = agents[name]
-            if reg["pane"] not in vivos:
+            if reg["pane"] not in alive:
                 raise OrqError(
-                    f"'{name}' nao existe mais — pane {reg['pane']} morreu. "
-                    f"(`orq ls` limpa o registro)"
+                    f"'{name}' no longer exists -- pane {reg['pane']} died. "
+                    f"(`orq ls` prunes the registry)"
                 )
             return ws, reg
-    raise OrqError(f"'{name}' nao existe")
+    raise OrqError(f"'{name}' does not exist")
 
 
 def caller_agent():
-    """Quem chamou, via $TMUX_PANE. E' isto que faz o `done` achar o pai sem o
-    worker precisar saber o nome de ninguem."""
+    """Who called, via $TMUX_PANE. This is what lets `done` find the parent
+    without the worker having to know anybody's name."""
     pane = os.environ.get("TMUX_PANE")
     if not pane or not WORKSPACES.exists():
         return None
     for f in sorted(WORKSPACES.glob("*.yml")):
-        for nome, reg in (read_state(f.stem).get("agents") or {}).items():
+        for name, reg in (read_state(f.stem).get("agents") or {}).items():
             if reg.get("pane") == pane:
-                return nome
+                return name
     return None
 
 
 def provider_cmd(nome_provider, session_id):
     provs = providers_config()
     if nome_provider not in provs:
-        conhecidos = ", ".join(sorted(provs)) or "(nenhum)"
-        raise OrqError(f"provider '{nome_provider}' desconhecido. Conhecidos: {conhecidos}")
+        known = ", ".join(sorted(provs)) or "(nenhum)"
+        raise OrqError(f"unknown provider '{nome_provider}'. Known: {known}")
     entry = provs[nome_provider]
     cmd = entry["cmd"] if isinstance(entry, dict) else str(entry)
-    # Detalhe #3: o session_id e' GERADO pelo orq, nao raspado da tela — assim
-    # ele e' conhecido antes de o agente subir e o `--resume` ja tem o que
-    # precisa. Providers que nao suportam simplesmente nao usam o placeholder.
+    # Detail #3: the session_id is GENERATED by orq, not scraped off the
+    # screen -- so it is known before the agent starts and `--resume` already
+    # has what it needs. Providers that do not support it simply leave the
+    # placeholder out.
     cmd = cmd.replace("{session_id}", session_id)
-    # Mesmo contrato do {session_id}: e' placeholder na TABELA. Provider que
-    # nao tem hook simplesmente nao usa, e cai no fallback de leitura de tela.
+    # Same contract as {session_id}: it is a placeholder in the TABLE. A
+    # provider with no hook simply leaves it out and falls back to reading the
+    # screen.
     if "{hooks}" in cmd:
         cmd = cmd.replace("{hooks}", shlex.quote(str(hooks_file(nome_provider))))
     return cmd
 
 
 def hooks_file(provider):
-    """Settings de hooks do provider, gerado pelo orq, e devolve o path.
+    """Writes the provider's hook settings and returns the path.
 
-    Fica FORA do settings global do agente de proposito: `claude --settings`
-    SOMA em vez de substituir, entao o orq nunca reescreve o
-    ~/.claude/settings.json do usuario -- que aqui ja tem seis hooks de outra
-    ferramenta -- e o hook so vale pros agentes que o orq subiu.
+    It lives OUTSIDE the agent's global settings on purpose: `claude --settings`
+    ADDS rather than replaces, so orq never rewrites the user's
+    ~/.claude/settings.json -- which here already carries six hooks from another
+    tool -- and the hook only applies to agents orq itself started.
     """
     HOOKS.mkdir(parents=True, exist_ok=True)
     exe = shlex.quote(str(Path(sys.argv[0]).resolve()))
-    # `|| true`: hook que falha nao pode atrapalhar o agente.
+    # `|| true`: a failing hook must never disturb the agent.
     entrada = [{"hooks": [{"type": "command",
                            "command": f"{exe} _status || true",
                            "timeout": 5}]}]
@@ -512,11 +537,11 @@ def hooks_file(provider):
     return path
 
 
-def set_status(ws, nome, status):
+def set_status(ws, name, status):
     agora = datetime.now(timezone.utc).astimezone().isoformat()
 
     def mutate(st):
-        a = (st.get("agents") or {}).get(nome)
+        a = (st.get("agents") or {}).get(name)
         if a is not None:
             a["status"] = status
             a["status_at"] = agora
@@ -524,72 +549,74 @@ def set_status(ws, nome, status):
 
 
 def agent_by(sid, pane):
-    """Acha o agente pelo session_id -- que e' identificador do ORQ, nao do
-    multiplexer -- caindo pro pane do tmux quando o provider nao o reporta."""
+    """Finds the agent by session_id -- which is ORQ's identifier, not the
+    multiplexer's -- falling back to the tmux pane when the provider does not
+    report one."""
     if not WORKSPACES.exists():
         return None, None
-    todos = []
+    all_regs = []
     for f in sorted(WORKSPACES.glob("*.yml")):
-        for nome, reg in (read_state(f.stem).get("agents") or {}).items():
-            todos.append((f.stem, nome, reg))
+        for name, reg in (read_state(f.stem).get("agents") or {}).items():
+            all_regs.append((f.stem, name, reg))
     for chave, valor in (("session_id", sid), ("pane", pane)):
         if not valor:
             continue
-        for ws, nome, reg in todos:
+        for ws, name, reg in all_regs:
             if reg.get(chave) == valor:
-                return ws, nome
+                return ws, name
     return None, None
 
 
-def paste_into(pane, texto, enter=True):
-    """Armadilha 4: NAO e' send-keys cru. Prompt com quebra de linha submeteria
-    no meio (Enter e' submit no Claude Code) e texto contendo nome de tecla
-    seria interpretado. set-buffer + paste-buffer -p (bracketed paste)."""
+def paste_into(pane, text, enter=True):
+    """Pitfall 4: NOT raw send-keys. A prompt with a line break would submit
+    halfway through (Enter is submit in Claude Code) and text containing a key
+    name would be interpreted. set-buffer + paste-buffer -p (bracketed paste)."""
     buf = f"orq-{uuid.uuid4().hex[:8]}"
-    tmux("set-buffer", "-b", buf, "--", texto)
+    tmux("set-buffer", "-b", buf, "--", text)
     tmux("paste-buffer", "-d", "-b", buf, "-p", "-t", pane)
     if enter:
         tmux("send-keys", "-t", pane, "Enter")
 
 
-def wait_for_ready(pane, binario, ready_when, blocked_when):
-    """Espera o agente estar PRONTO PRA RECEBER INPUT — nao apenas existir.
+def wait_for_ready(pane, binary, ready_when, blocked_when):
+    """Waits for the agent to be READY TO ACCEPT INPUT -- not merely to exist.
 
-    Armadilha 5, corrigida em 31/08 com um Claude real: `pane_current_command`
-    vira o provider em milissegundos, mas a TUI so aceita input muito depois.
-    Confiar nisso manda o prompt pro vazio — foi o que aconteceu, com o pane
-    parado no dialogo de confianca e o orq dizendo "prompt enviado".
+    Pitfall 5, fixed on 2026-08-31 against a real Claude:
+    `pane_current_command` becomes the provider within milliseconds, but the TUI
+    only accepts input much later. Trusting it sends the prompt into the void --
+    which is exactly what happened, with the pane sitting on the trust dialog
+    and orq reporting "prompt sent".
 
-    Prontidao e' DADO, nao codigo: cada provider declara `ready_when` e
-    `blocked_when` no providers.yml. Agnosticismo aqui e' uma tabela, nao uma
-    arquitetura — mesma razao de nao existir interface abstrata de provider.
+    Readiness is DATA, not code: each provider declares `ready_when` and
+    `blocked_when` in providers.yml. Agnosticism here is a table, not an
+    architecture -- the same reason there is no abstract provider interface.
 
-    Devolve (pronto: bool, motivo: str|None).
+    Returns (ready: bool, reason: str|None).
     """
     ready_re = re.compile(ready_when, re.M) if ready_when else None
     blocked_re = re.compile(blocked_when, re.M) if blocked_when else None
-    limite = time.monotonic() + BOOT_TIMEOUT_S
-    tela = ""
-    while time.monotonic() < limite:
-        # Arvore de processos, nao `pane_current_command`: em pane nascido de
-        # split-window o tmux reporta o shell, entao esta porta NUNCA abria e
-        # `spawn --split --prompt` estourava os 30s sem sequer olhar a tela.
-        # Mesma causa que furava a recusa do `wt rm` e mentia no `ls`.
+    deadline = time.monotonic() + BOOT_TIMEOUT_S
+    screen = ""
+    while time.monotonic() < deadline:
+        # Process tree, not `pane_current_command`: in a pane born from
+        # split-window tmux reports the shell, so this gate NEVER opened and
+        # `spawn --split --prompt` blew the 30s without even looking at the
+        # screen. Same cause that defeated the `wt rm` refusal and lied in `ls`.
         p = tmux("display-message", "-p", "-t", pane, "#{pane_pid}", check=False)
         vivo = (p.returncode == 0
-                and binario in pane_procs(p.stdout.strip()))
+                and binary in pane_procs(p.stdout.strip()))
         if vivo:
             c = tmux("capture-pane", "-p", "-t", pane, check=False)
-            tela = c.stdout if c.returncode == 0 else ""
-            if blocked_re and blocked_re.search(tela):
-                achado = blocked_re.search(tela).group(0).strip()
-                return False, f"o agente esta bloqueado num dialogo: {achado!r}"
-            if ready_re is None or ready_re.search(tela):
+            screen = c.stdout if c.returncode == 0 else ""
+            if blocked_re and blocked_re.search(screen):
+                found = blocked_re.search(screen).group(0).strip()
+                return False, f"the agent is stuck on a dialog: {found!r}"
+            if ready_re is None or ready_re.search(screen):
                 return True, None
         time.sleep(BOOT_POLL_S)
-    if not tela:
-        return False, f"'{binario}' nao apareceu em {BOOT_TIMEOUT_S}s"
-    return False, f"'{binario}' subiu mas nao ficou pronto em {BOOT_TIMEOUT_S}s"
+    if not screen:
+        return False, f"'{binary}' did not appear within {BOOT_TIMEOUT_S}s"
+    return False, f"'{binary}' started but was not ready within {BOOT_TIMEOUT_S}s"
 
 
 # --- comandos ---------------------------------------------------------------
@@ -601,10 +628,11 @@ def systemctl(*a, check=True):
 
 
 def orq_timezone():
-    """Fuso a escrever nas unidades. NUNCA se omite: quando um agente pede
-    "todo dia as 19h" ele quer dizer 19h DO USER, e nao tem como saber em que
-    fuso a caixa esta. A regra vale mesmo com a maquina no fuso certo -- em
-    31/08 a asimov estava em Etc/UTC e um `19:03` cru dispararia 16:03."""
+    """The timezone written into every unit. NEVER omitted: when an agent asks
+    for "every day at 7pm" it means the USER's 7pm, and it cannot know which
+    timezone the box is in. The rule holds even with the machine set correctly
+    -- on 2026-08-31 this host was on Etc/UTC and a bare `19:03` would have
+    fired at 16:03."""
     cfg = load_yaml(CONFIG, "config.yml") if CONFIG.exists() else {}
     tz = (cfg or {}).get("timezone")
     if tz:
@@ -614,7 +642,7 @@ def orq_timezone():
 
 
 def _tok(tok):
-    """Campo de cron -> campo de calendario systemd."""
+    """Campo de cron -> campo de calendar systemd."""
     if tok == "*":
         return "*"
     t = tok.replace("-", "..")
@@ -626,73 +654,89 @@ def _tok(tok):
 def _dow(tok):
     if tok == "*":
         return ""
-    nomes = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     def um(x):
-        return nomes[int(x)] if x.isdigit() and int(x) <= 7 else x
-    partes = []
+        return names[int(x)] if x.isdigit() and int(x) <= 7 else x
+    parts = []
     for parte in tok.split(","):
         if "-" in parte:
             a, b = parte.split("-", 1)
-            partes.append(f"{um(a)}..{um(b)}")
+            parts.append(f"{um(a)}..{um(b)}")
         else:
-            partes.append(um(parte))
-    return ",".join(partes) + " "
+            parts.append(um(parte))
+    return ",".join(parts) + " "
 
 
 def cron_to_calendar(expr, tz):
-    campos = expr.split()
-    if len(campos) != 5:
+    fields = expr.split()
+    if len(fields) != 5:
         raise OrqError(
-            f"cron precisa de 5 campos (min hora dia mes dia-da-semana), "
-            f"veio {len(campos)}: '{expr}'"
+            f"cron needs 5 fields (min hour day month weekday), "
+            f"got {len(fields)}: '{expr}'"
         )
-    m, h, dom, mon, dow = campos
+    m, h, dom, mon, dow = fields
     return (f"{_dow(dow)}*-{_tok(mon)}-{_tok(dom)} "
             f"{_tok(h)}:{_tok(m)}:00 {tz}")
 
 
-def calendar_next(calendario):
-    """`systemd-analyze calendar` e' o validador de graca: valida a expressao
-    E imprime a proxima execucao, entao nao ha parser de cron escrito a mao
-    pra confiar."""
-    r = run(["systemd-analyze", "calendar", calendario], check=False)
+def calendar_next(calendar):
+    """`systemd-analyze calendar` is the free validator: it validates the
+    expression AND prints the next run, so there is no hand-written cron parser
+    to trust."""
+    r = run(["systemd-analyze", "calendar", calendar], check=False)
     if r.returncode != 0:
         detalhe = (r.stderr or r.stdout or "").strip().splitlines()
-        raise OrqError(f"calendario invalido '{calendario}': "
+        raise OrqError(f"invalid calendar '{calendar}': "
                        f"{detalhe[0] if detalhe else 'recusado pelo systemd'}")
-    for linha in r.stdout.splitlines():
-        if "Next elapse:" in linha:
-            return linha.split("Next elapse:", 1)[1].strip()
+    for line in r.stdout.splitlines():
+        if "Next elapse:" in line:
+            return line.split("Next elapse:", 1)[1].strip()
     return "?"
 
 
 def sched_units():
-    """O que o SYSTEMD conhece, nao o que ha no disco."""
+    """What SYSTEMD knows about, not what happens to be on disk."""
     r = systemctl("list-unit-files", f"{SCHED_PREFIX}*.timer",
                   "--no-legend", "--plain", check=False)
-    nomes = []
-    for linha in r.stdout.splitlines():
-        campos = linha.split()
-        if campos and campos[0].endswith(".timer"):
-            nomes.append(campos[0][len(SCHED_PREFIX):-len(".timer")])
-    return sorted(nomes)
+    names = []
+    for line in r.stdout.splitlines():
+        fields = line.split()
+        if fields and fields[0].endswith(".timer"):
+            names.append(fields[0][len(SCHED_PREFIX):-len(".timer")])
+    return sorted(names)
 
 
-def sched_meta(nome):
-    """Metadados vem das linhas `# orq:` da propria unidade -- e' isto que faz
-    a unidade se autodescrever e dispensa um espelho pra divergir."""
-    r = systemctl("cat", f"{SCHED_PREFIX}{nome}.service", check=False)
+def sched_meta(name):
+    """Metadata comes from the unit's own `# orq:` lines -- that is what makes
+    the unit self-describing and removes any mirror that could drift."""
+    r = systemctl("cat", f"{SCHED_PREFIX}{name}.service", check=False)
     meta, execstart = {}, None
-    for linha in r.stdout.splitlines():
-        if linha.startswith("# orq:"):
-            for par in linha[len("# orq:"):].strip().split("  "):
+    for line in r.stdout.splitlines():
+        if line.startswith("Description="):
+            meta["desc"] = sched_desc(name, line[len("Description="):])
+        if line.startswith("# orq:"):
+            for par in line[len("# orq:"):].strip().split("  "):
                 if "=" in par:
                     k, v = par.split("=", 1)
                     meta[k.strip()] = v.strip()
-        elif linha.startswith("ExecStart="):
-            execstart = linha[len("ExecStart="):]
+        elif line.startswith("ExecStart="):
+            execstart = line[len("ExecStart="):]
     meta["exec"] = execstart
     return meta
+
+
+def sched_desc(name, description):
+    """The description lives in the unit's `Description=` and nowhere else.
+
+    Format: `orq schedule: <name>` without one, `orq schedule: <name> — <d>`
+    with. It splits unambiguously because a name accepts neither spaces nor `—`
+    (NAME_RE). It could have become one more `# orq:` line, but then the same
+    sentence would live in two places -- and `Description=` is precisely the
+    human field systemd already shows in `list-timers` and `status`."""
+    prefix = f"orq schedule: {name}"
+    if description and description.startswith(prefix + " — "):
+        return description[len(prefix) + 3:]
+    return ""
 
 
 def cmd_up(args, quiet=False):
@@ -702,9 +746,9 @@ def cmd_up(args, quiet=False):
     if not session_exists(session):
         tmux("new-session", "-d", "-s", session, "-n", LEAD_WINDOW,
              "-c", str(lead_root(cfg)))
-        # `set-option -t` e' alvo de PANE, entao `=<sessao>` sozinho nao resolve
-        # ("no such session"). O `:` final o torna alvo de sessao, e o `=` segue
-        # impedindo casar com uma sessao de nome parecido.
+        # `set-option -t` takes a PANE target, so `=<session>` alone does not
+        # resolve ("no such session"). The trailing `:` makes it a session
+        # target, and the `=` still prevents matching a similarly named one.
         for opt in (("status-left", "#[bold] #S #[default]| "),
                     ("status-left-length", "18"),
                     ("status-interval", "5")):
@@ -713,11 +757,11 @@ def cmd_up(args, quiet=False):
              check=False)
         log_event(cmd="up", ws=ws, session=session, created=True, ok=True)
         if not quiet:
-            print(f"sessao '{session}' criada")
+            print(f"session '{session}' created")
     else:
         log_event(cmd="up", ws=ws, session=session, created=False, ok=True)
         if not quiet:
-            print(f"sessao '{session}' ja existia")
+            print(f"session '{session}' already existed")
     if not quiet:
         print(f"attach:  tmux -L {SOCKET} attach -t {session}")
 
@@ -727,7 +771,7 @@ def cmd_attach(args):
     cfg = workspace_config(ws)
     session = cfg.get("session") or ws
     if not session_exists(session):
-        raise OrqError(f"sessao '{session}' nao existe — rode `orq up {ws}`")
+        raise OrqError(f"session '{session}' does not exist -- run `orq up {ws}`")
     os.execvp("tmux", ["tmux", "-L", SOCKET, "attach", "-t", session])
 
 
@@ -745,16 +789,16 @@ def cmd_wt_new(args):
         cmd_up(argparse.Namespace(ws=ws), quiet=True)
 
     if dst.exists():
-        raise OrqError(f"worktree ja existe: {dst}")
+        raise OrqError(f"worktree already exists: {dst}")
 
-    # Base fresca. `git fetch` NAO move a main local — so cortando de
-    # origin/<default> a base e' fresca de verdade. Fetch que falha aborta.
+    # Fresh base. `git fetch` does NOT move the local main -- only branching
+    # off origin/<default> is genuinely fresh. A failing fetch aborts.
     if not args.no_fetch:
         git(src, "fetch", "origin", "--prune")
 
     reused = branch_exists(src, branch)
     if reused:
-        # Branch existente e' reusada e NUNCA rebaseada.
+        # An existing branch is reused and NEVER rebased.
         base = branch
         git(src, "worktree", "add", str(dst), branch)
     else:
@@ -768,7 +812,7 @@ def cmd_wt_new(args):
     if not args.no_hooks:
         run_post_create(cfg, dst)
 
-    # Armadilha 1: `-d`. Sem isso a janela rouba o foco do humano.
+    # Pitfall 1: `-d`. Without it the window steals the human's focus.
     window = f"{repo}/{slug}"
     tmux("new-window", "-d", "-t", f"={session}", "-n", window, "-c", str(dst))
 
@@ -776,7 +820,7 @@ def cmd_wt_new(args):
         state.setdefault("worktrees", {})[window] = {
             "repo": repo, "slug": slug, "branch": branch,
             "path": str(dst), "base": base, "base_sha": base_sha,
-            # descontado da checagem de sujeira: o orq criou, nao o usuario
+            # discounted from the dirty check: orq put these here, not the user
             "orq_files": sorted(ops["copied"] + ops["linked"]),
             "created_at": datetime.now(timezone.utc).astimezone().isoformat(),
         }
@@ -786,17 +830,18 @@ def cmd_wt_new(args):
               path=str(dst), base=base, base_sha=base_sha, reused_branch=reused,
               files=ops, ok=True)
     print(f"{window}  ->  {dst}")
-    print(f"  branch {branch} {'(reusada, nao rebaseada)' if reused else f'de {base} @ {base_sha[:8]}'}")
+    print(f"  branch {branch} {'(reused, not rebased)' if reused else f'from {base} @ {base_sha[:8]}'}")
     if ops["copied"] or ops["linked"]:
-        print(f"  files: {len(ops['copied'])} copiados, {len(ops['linked'])} linkados")
+        print(f"  files: {len(ops['copied'])} copied, {len(ops['linked'])} linked")
 
-    # `wt new` + `spawn` e' a sequencia mais comum do orq. A flag existia no
-    # parser desde a Fase 1 e nunca era lida: aceitava e ignorava em silencio,
-    # que e' pior que nao existir -- os stubs pelo menos recusam falando.
+    # `wt new` + `spawn` is the most common sequence in orq. The flag had been
+    # in the parser since Phase 1 and was never read: it accepted and ignored in
+    # silence, which is worse than not existing -- the stubs at least refuse out
+    # loud.
     if args.spawn:
-        nome = args.as_name or slug.replace("/", "-")
+        name = args.as_name or slug.replace("/", "-")
         cmd_spawn(argparse.Namespace(
-            name=nome, ws=ws, ws_pos=None, wt=window, provider=args.spawn,
+            name=name, ws=ws, ws_pos=None, wt=window, provider=args.spawn,
             cmd_str=None, prompt=args.prompt, parent=None, split=False,
         ))
 
@@ -811,88 +856,90 @@ def cmd_wt_rm(args):
     dst = worktree_path(cfg, repo, slug)
 
     if not dst.exists():
-        raise OrqError(f"worktree nao existe: {dst}")
+        raise OrqError(f"worktree does not exist: {dst}")
 
     if not args.force:
-        recusas = []
-        meus = read_state(ws).get("worktrees", {}).get(window, {}).get("orq_files", [])
-        sujos = dirty_entries(dst, meus)
-        if sujos:
-            amostra = ", ".join(sujos[:3]) + ("…" if len(sujos) > 3 else "")
-            recusas.append(f"a arvore esta suja ({amostra})")
+        refusals = []
+        ours = read_state(ws).get("worktrees", {}).get(window, {}).get("orq_files", [])
+        dirty_list = dirty_entries(dst, ours)
+        if dirty_list:
+            sample = ", ".join(dirty_list[:3]) + ("…" if len(dirty_list) > 3 else "")
+            refusals.append(f"the tree is dirty ({sample})")
         branch = git(dst, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
-        pendentes = unpushed_commits(dst, branch)
-        if pendentes:
-            recusas.append(f"{len(pendentes)} commit(s) fora do origin em '{branch}'")
-        # "Agente vivo" = um provider rodando DENTRO do pane. Olha a arvore de
-        # processos, nao o `pane_current_command`: este ultimo reporta o shell
-        # pros panes nascidos de split-window, e escondia todo agente a partir
-        # do segundo. Bash esquecido no prompt continua nao travando.
-        conhecidos = set(providers_config())
-        vivos = []
+        unpushed = unpushed_commits(dst, branch)
+        if unpushed:
+            refusals.append(f"{len(unpushed)} commit(s) not on origin in '{branch}'")
+        # "Agent alive" = a provider running INSIDE the pane. Reads the process
+        # tree, not `pane_current_command`: the latter reports the shell for
+        # panes born from split-window, and hid every agent from the second one
+        # on. A bash left at a prompt still does not block.
+        known = set(providers_config())
+        alive = []
         for p in list_panes(session):
             if p["window"] != window:
                 continue
-            achados = [c for c in p["procs"] if c in conhecidos]
+            achados = [c for c in p["procs"] if c in known]
             if achados:
-                vivos.append((achados[0], p["pane"]))
-        if vivos:
-            nomes = ", ".join(f"{c}@{pane}" for c, pane in vivos)
-            recusas.append(f"agente vivo dentro ({nomes})")
-        if recusas:
-            log_event(cmd="wt rm", ws=ws, wt=window, ok=False, refused=recusas)
+                alive.append((achados[0], p["pane"]))
+        if alive:
+            names = ", ".join(f"{c}@{pane}" for c, pane in alive)
+            refusals.append(f"a live agent inside ({names})")
+        if refusals:
+            log_event(cmd="wt rm", ws=ws, wt=window, ok=False, refused=refusals)
             raise OrqError(
-                f"recusado: {'; '.join(recusas)}.\n"
-                f"  use --force pra remover mesmo assim (a branch NUNCA e' apagada)"
+                f"refused: {'; '.join(refusals)}.\n"
+                f"  use --force to remove anyway (the branch is NEVER deleted)"
             )
 
-    # Os arquivos que o orq colocou sao untracked pro git, entao sem isto o
-    # `git worktree remove` recusa SEMPRE que o workspace tem `files:` — a
-    # checagem de sujeira ja os descontava e a remocao nao, o que travava o
-    # comando por incoerencia. Symlink sai sempre (o alvo nao e' tocado);
-    # copia so sai se estiver IDENTICA a origem, senao e' edicao do usuario e
-    # vira recusa em vez de perda silenciosa.
-    meus = read_state(ws).get("worktrees", {}).get(window, {}).get("orq_files", [])
-    # DUAS passadas: classifica tudo, decide, so entao apaga. Numa passada so,
-    # a recusa chegava depois de ja ter apagado os itens anteriores da lista.
-    aptos, mexidos = [], []
-    for rel in meus:
-        alvo = dst / rel
-        if alvo.is_symlink():
-            aptos.append(rel)                    # o alvo do link nao e' tocado
-        elif alvo.is_file():
-            origem = src / rel
-            igual = origem.is_file() and origem.read_bytes() == alvo.read_bytes()
-            (aptos if (igual or args.force) else mexidos).append(rel)
-        elif alvo.is_dir():
-            aptos.append(rel)
-    if mexidos:
-        log_event(cmd="wt rm", ws=ws, wt=window, ok=False, modified=mexidos)
+    # The files orq put here are untracked as far as git is concerned, so
+    # without this `git worktree remove` refuses WHENEVER the workspace has
+    # `files:` -- the dirty check already discounted them and the removal did
+    # not, which jammed the command out of sheer inconsistency. A symlink always
+    # goes (its target is untouched); a copy only goes if IDENTICAL to the
+    # source, otherwise it is the user's edit and becomes a refusal instead of a
+    # silent loss.
+    ours = read_state(ws).get("worktrees", {}).get(window, {}).get("orq_files", [])
+    # TWO passes: classify everything, decide, only then delete. In a single
+    # pass the refusal arrived after the earlier items were already gone.
+    removable, modified = [], []
+    for rel in ours:
+        target = dst / rel
+        if target.is_symlink():
+            removable.append(rel)                    # the link's target is untouched
+        elif target.is_file():
+            source = src / rel
+            igual = source.is_file() and source.read_bytes() == target.read_bytes()
+            (removable if (igual or args.force) else modified).append(rel)
+        elif target.is_dir():
+            removable.append(rel)
+    if modified:
+        log_event(cmd="wt rm", ws=ws, wt=window, ok=False, modified=modified)
         raise OrqError(
-            f"recusado: {', '.join(mexidos)} — o orq colocou esse(s) arquivo(s) "
-            f"aqui, mas voce editou desde entao.\n"
-            f"  salve o que interessa e rode de novo, ou use --force pra perder"
+            f"refused: {', '.join(modified)} -- orq put that file (or those files) "
+            f"here, but you have edited them since.\n"
+            f"  save what matters and run again, or use --force to lose it"
         )
 
-    apagados = []
-    for rel in aptos:
-        alvo = dst / rel
-        if alvo.is_symlink() or alvo.is_file():
-            alvo.unlink()
-        elif alvo.is_dir():
-            shutil.rmtree(alvo)
-        apagados.append(rel)
+    removed = []
+    for rel in removable:
+        target = dst / rel
+        if target.is_symlink() or target.is_file():
+            target.unlink()
+        elif target.is_dir():
+            shutil.rmtree(target)
+        removed.append(rel)
 
-    # O git PRIMEIRO. Ao contrario, uma recusa do git deixava a janela morta e
-    # o worktree de pe: perdiam-se os panes e nao se removia nada.
+    # git FIRST. The other way around, a refusal from git left the window dead
+    # and the worktree standing: the panes were lost and nothing was removed.
     try:
         git(src, "worktree", "remove", str(dst),
             *(["--force"] if args.force else []))
     except OrqError:
-        # A remocao falhou DEPOIS de eu tirar os arquivos que o orq pos aqui.
-        # Sem devolver, o worktree sobrevive mutilado -- sem .env e sem
-        # node_modules a app nao sobe, e nada na tela explicaria por que.
-        if apagados:
+        # The removal failed AFTER we took out the files orq had put here.
+        # Without putting them back the worktree survives mutilated -- with no
+        # .env and no node_modules the app will not start, and nothing on screen
+        # would explain why.
+        if removed:
             apply_file_ops(cfg, src, dst)
         raise
     if window_exists(session, window):
@@ -903,94 +950,95 @@ def cmd_wt_rm(args):
     update_state(ws, mutate)
 
     log_event(cmd="wt rm", ws=ws, wt=window, path=str(dst), forced=args.force,
-              orq_files_removed=apagados, ok=True)
-    print(f"{window} removido (branch preservada)")
-    if apagados:
-        print(f"  apagados (postos pelo orq): {', '.join(apagados)}")
+              orq_files_removed=removed, ok=True)
+    print(f"{window} removed (branch preserved)")
+    if removed:
+        print(f"  removed (placed by orq): {', '.join(removed)}")
 
 
 def cmd_spawn(args):
     if not NAME_RE.match(args.name):
-        raise OrqError(f"nome invalido: '{args.name}' (esperado {NAME_RE.pattern})")
+        raise OrqError(f"invalid name: '{args.name}' (expected {NAME_RE.pattern})")
     if args.cmd_str and args.prompt:
-        raise OrqError("--prompt so faz sentido com provider, nao com --cmd")
+        raise OrqError("--prompt only makes sense with a provider, not with --cmd")
     ws = resolve_ws(ws_arg(args))
     cfg = workspace_config(ws)
     session = cfg.get("session") or ws
 
     state = read_state(ws)
     if args.name in (state.get("agents") or {}):
-        raise OrqError(f"'{args.name}' ja esta em uso neste workspace")
+        raise OrqError(f"'{args.name}' is already in use in this workspace")
 
-    criei_janela = False
+    made_window = False
     if args.wt:
         repo, slug = split_target(args.wt)
         window = f"{repo}/{slug}"
         meta = (state.get("worktrees") or {}).get(window)
         if not meta:
-            raise OrqError(f"worktree '{window}' nao existe — rode `orq wt new` antes")
+            raise OrqError(f"worktree '{window}' does not exist -- run `orq wt new` first")
         if not window_exists(session, window):
-            raise OrqError(f"a janela '{window}' nao esta viva — rode `orq resurrect`")
+            raise OrqError(f"window '{window}' is not alive -- run `orq resurrect`")
         path = meta["path"]
     else:
-        # Sem --wt o agente e' de nivel de workspace: nasce no `root:`, na
-        # janela _lead. A janela e' recriada se sumiu, porque `resurrect` so
-        # cuida de worktree e a sessao pode ter perdido so esta.
+        # With no --wt the agent is workspace-level: it is born at `root:`, in
+        # the _lead window. The window is recreated if it vanished, because
+        # `resurrect` only handles worktrees and the session may have lost just
+        # this one.
         if not session_exists(session):
-            raise OrqError(f"sessao '{session}' nao existe — rode `orq up {ws}`")
+            raise OrqError(f"session '{session}' does not exist -- run `orq up {ws}`")
         window = LEAD_WINDOW
         path = str(lead_root(cfg))
         if not window_exists(session, window):
             tmux("new-window", "-d", "-t", f"={session}", "-n", window, "-c", path)
-            criei_janela = True
+            made_window = True
 
     session_id = str(uuid.uuid4())
     if args.cmd_str:
         provider = None
-        # `--cmd` roda literalmente, mas embrulhado: sem isso o pane FECHA
-        # quando a ferramenta sai, e some antes de ser lido quando a saida e'
-        # curta (git diff com less -F encerra sozinho se cabe numa tela).
+        # `--cmd` runs literally, but wrapped: without this the pane CLOSES
+        # when the tool exits, and vanishes before it can be read when the
+        # output is short (git diff with less -F quits by itself when it fits).
         launch = f"{args.cmd_str}; exec $SHELL"
-        binario = None
+        binary = None
     else:
         provider = args.provider or cfg.get("provider") or "claude"
         base = provider_cmd(provider, session_id)
         launch = f"{base}; exec $SHELL"
-        binario = base.split()[0]
+        binary = base.split()[0]
         pcfg = providers_config().get(provider) or {}
         ready_when = pcfg.get("ready_when") if isinstance(pcfg, dict) else None
         blocked_when = pcfg.get("blocked_when") if isinstance(pcfg, dict) else None
 
-    # Toma o pane que ja existe se a janela nao tem agente registrado e o pane
-    # esta num shell parado — senao o primeiro agente desperdica meia tela com
-    # um bash que ninguem pediu.
+    # Take over the existing pane when the window has no registered agent and
+    # that pane sits at an idle shell -- otherwise the first agent wastes half
+    # the screen on a bash nobody asked for.
     panes = [p for p in list_panes(session) if p["window"] == window]
-    registrados = {a["pane"] for a in (state.get("agents") or {}).values()}
-    # Livre = shell parado de verdade. `command in SHELLS` sozinho nao basta:
-    # pane com agente vivo tambem reporta shell quando nasceu de split-window,
-    # e tomar esse pane colaria o launch por cima de um agente trabalhando.
-    livres = [p for p in panes if p["pane"] not in registrados
+    registered = {a["pane"] for a in (state.get("agents") or {}).values()}
+    # Free = a genuinely idle shell. `command in SHELLS` alone is not enough:
+    # a pane with a live agent also reports a shell when it was born from
+    # split-window, and taking it would paste the launch over a working agent.
+    free = [p for p in panes if p["pane"] not in registered
               and p["command"] in SHELLS
               and all(c in SHELLS for c in p["procs"])]
-    # Janela que o proprio spawn acabou de criar tem um pane so, novo e de
-    # ninguem — nao precisa da heuristica de shell parado, e nao pode usa-la:
-    # por ~50ms depois do `new-window` o tmux ainda reporta `tmux` como
-    # pane_current_command, entao o pane nao casaria com SHELLS e o spawn
-    # dividiria a janela deixando um bash orfao ao lado.
-    tomar = (not args.split) and (
-        criei_janela or (len(panes) == 1 and len(livres) == 1))
+    # A window spawn itself just created has exactly one pane, new and
+    # nobody's -- it does not need the idle-shell heuristic, and it cannot use
+    # it: for ~50ms after `new-window` tmux still reports `tmux` as
+    # pane_current_command, so the pane would not match SHELLS and spawn would
+    # split the window, leaving an orphan bash beside it.
+    take = (not args.split) and (
+        made_window or (len(panes) == 1 and len(free) == 1))
 
-    if tomar:
-        # Na janela recem-criada o unico pane e' o nosso e `livres` esta vazio
-        # pela mesma corrida de pane_current_command — entao pega de `panes`.
-        pane = (panes if criei_janela else livres)[0]["pane"]
+    if take:
+        # In the freshly created window the only pane is ours and `free` is
+        # empty from that same pane_current_command race -- take from `panes`.
+        pane = (panes if made_window else free)[0]["pane"]
         tmux("send-keys", "-t", pane, "-l", launch)
         tmux("send-keys", "-t", pane, "Enter")
     else:
-        # Armadilha 1: `-d`. Sem isso o pane novo rouba o foco do humano.
-        alvo = f"={session}:{window}"
+        # Pitfall 1: `-d`. Without it the new pane steals the human's focus.
+        target = f"={session}:{window}"
         p = tmux("split-window", "-d", "-P", "-F", "#{pane_id}",
-                 "-t", alvo, "-c", path, launch)
+                 "-t", target, "-c", path, launch)
         pane = p.stdout.strip()
 
     parent = args.parent or caller_agent()
@@ -1008,41 +1056,41 @@ def cmd_spawn(args):
               window=window, name=args.name, pane=pane,
               provider=provider, cmd_str=args.cmd_str,
               session_id=session_id if provider else None, parent=parent,
-              took_existing=tomar, ok=True)
+              took_existing=take, ok=True)
 
-    print(f"{args.name}  {pane}  em {window}"
+    print(f"{args.name}  {pane}  in {window}"
           f"{f'  ({provider})' if provider else f'  ({args.cmd_str})'}"
-          f"{'  [tomou o pane existente]' if tomar else ''}")
+          f"{'  [took the existing pane]' if take else ''}")
     if parent:
-        print(f"  pai: {parent}")
+        print(f"  parent: {parent}")
 
     if args.prompt:
-        pronto, motivo = wait_for_ready(pane, binario, ready_when, blocked_when)
-        if not pronto:
+        ready, reason = wait_for_ready(pane, binary, ready_when, blocked_when)
+        if not ready:
             log_event(cmd="spawn", ws=ws, name=args.name, pane=pane,
-                      prompt_sent=False, reason=motivo, ok=False)
+                      prompt_sent=False, reason=reason, ok=False)
             raise OrqError(
-                f"'{args.name}' subiu, mas o PROMPT NAO FOI ENVIADO: {motivo}.\n"
-                f"  o pane esta vivo — resolva na tela e mande com:\n"
+                f"'{args.name}' started, but the PROMPT WAS NOT SENT: {reason}.\n"
+                f"  the pane is alive -- resolve it on screen and send with:\n"
                 f"    orq send {args.name} \"...\""
             )
         paste_into(pane, args.prompt)
         log_event(cmd="send", ws=ws, name=args.name, pane=pane,
-                  chars=len(args.prompt), origem="spawn --prompt", ok=True)
-        print(f"  prompt enviado ({len(args.prompt)} chars)")
+                  chars=len(args.prompt), source="spawn --prompt", ok=True)
+        print(f"  prompt sent ({len(args.prompt)} chars)")
 
 
 def cmd_send(args):
     ws, reg = find_agent(args.name)
-    # Armadilha 6(b): NAO checa se o input esta livre. A caixa do Claude Code
-    # mostra sugestao contextual indistinguivel de texto digitado, e ele
-    # enfileira sozinho o que chega durante a geracao. Cola e manda.
+    # Pitfall 6(b): does NOT check whether the input box is free. Claude Code
+    # shows a contextual suggestion indistinguishable from typed text, and it
+    # queues by itself whatever arrives mid-generation. Paste and send.
     paste_into(reg["pane"], args.text, enter=not args.no_enter)
 
-    # Input novo significa que ele nao esta mais "done". Sem isto o registro
-    # mentiria no follow-up: o pai manda mais trabalho e o `ls` continua
-    # mostrando terminado. Quando os hooks chegarem eles sobrescrevem com
-    # `working`; ate la, limpar e' melhor que afirmar o que nao e' verdade.
+    # New input means it is no longer "done". Without this the registry would
+    # lie on a follow-up: the parent sends more work and `ls` keeps showing it
+    # finished. Once the hooks land they overwrite with `working`; until then,
+    # clearing beats asserting something untrue.
     if reg.get("status"):
         def mutate(st):
             a = (st.get("agents") or {}).get(args.name)
@@ -1062,76 +1110,79 @@ def cmd_keys(args):
 
 
 def cmd_done(args):
-    """Fecha o turno: grava o status no registro e avisa o pai.
+    """Closes the turn: writes the status to the registry and notifies the
+    parent.
 
-    NAO mata o pane. `done` quer dizer "terminei meu turno", nao "o trabalho
-    acabou" -- o trabalho acaba no merge e a faxina e' do `wt rm`. O pane fica
-    de pe com a conversa na tela, pronto pra follow-up sem custo de --resume.
+    It does NOT kill the pane. `done` means "I finished my turn", not "the work
+    is over" -- the work ends at the merge, and the cleanup belongs to `wt rm`.
+    The pane stays up with the conversation on screen, ready for a follow-up
+    with no --resume cost.
 
-    Nao existe `orq wait` do outro lado: o pai que encerrou o turno ja esta
-    ocioso esperando input, e este send chega como mensagem nova e o acorda.
+    There is no `orq wait` on the other side: a parent that ended its turn is
+    already idle waiting for input, and this send arrives as a new message and
+    wakes it.
     """
-    nome = caller_agent()
-    if not nome:
+    name = caller_agent()
+    if not name:
         raise OrqError(
-            "`done` so vale de dentro do pane de um agente registrado — "
-            "$TMUX_PANE nao casa com nenhum agente do registro"
+            "`done` is only valid from inside a registered agent's pane -- "
+            "$TMUX_PANE matches no agent in the registry"
         )
-    ws, reg = find_agent(nome)
+    ws, reg = find_agent(name)
 
-    set_status(ws, nome, "done")
+    set_status(ws, name, "done")
 
-    destino = args.to or reg.get("parent")
-    msg = f"[{nome}] done" + (f": {args.msg}" if args.msg else "")
+    dest = args.to or reg.get("parent")
+    msg = f"[{name}] done" + (f": {args.msg}" if args.msg else "")
 
-    # O status e' gravado antes de tentar entregar, e nao e' desfeito se a
-    # entrega falhar: quem terminou terminou, exista ou nao destinatario.
-    if not destino:
-        log_event(cmd="done", ws=ws, name=nome, pane=reg["pane"], to=None,
-                  msg=args.msg, delivered=False, reason="sem pai", ok=True)
-        print(f"{nome}: status done gravado")
-        print("  ninguem avisado — sem pai no registro e sem --to")
+    # The status is written before delivery is attempted, and is not undone if
+    # delivery fails: whoever finished finished, recipient or no recipient.
+    if not dest:
+        log_event(cmd="done", ws=ws, name=name, pane=reg["pane"], to=None,
+                  msg=args.msg, delivered=False, reason="sem parent_", ok=True)
+        print(f"{name}: status done recorded")
+        print("  nobody notified -- no parent in the registry and no --to")
         return
 
     try:
-        _, reg_pai = find_agent(destino)
+        _, reg_pai = find_agent(dest)
     except OrqError as e:
-        log_event(cmd="done", ws=ws, name=nome, pane=reg["pane"], to=destino,
+        log_event(cmd="done", ws=ws, name=name, pane=reg["pane"], to=dest,
                   msg=args.msg, delivered=False, reason=str(e), ok=False)
-        raise OrqError(f"status done gravado, mas '{destino}' nao foi avisado: {e}")
+        raise OrqError(f"status done recorded, but '{dest}' was not notified: {e}")
 
     paste_into(reg_pai["pane"], msg)
-    log_event(cmd="done", ws=ws, name=nome, pane=reg["pane"], to=destino,
+    log_event(cmd="done", ws=ws, name=name, pane=reg["pane"], to=dest,
               to_pane=reg_pai["pane"], msg=args.msg, delivered=True, ok=True)
-    print(f"{nome}: status done gravado; avisei '{destino}' ({reg_pai['pane']})")
+    print(f"{name}: status done recorded; notified '{dest}' ({reg_pai['pane']})")
 
 
 def cmd_status_hook(args):
-    """Chamado PELO agente, via hook do provider. Le o payload no stdin e
-    traduz o evento em status.
+    """Called BY the agent, through the provider's hook. Reads the payload on
+    stdin and translates the event into a status.
 
-    Silencioso por contrato, e engole toda excecao: hook que fala polui a tela
-    do agente e hook que quebra atrapalha o turno dele. Nao escreve no
-    log.jsonl -- o log e' de comandos que alguem emitiu, e o estado vive no
-    registro, que ja sai por `orq ls --json`.
+    Silent by contract, and it swallows every exception: a hook that talks
+    pollutes the agent's screen and a hook that breaks disturbs its turn. It
+    does not write to log.jsonl -- the log is for commands somebody issued, and
+    the state lives in the registry, which already comes out of `orq ls --json`.
     """
     try:
         payload = json.loads(sys.stdin.read() or "{}")
         status = HOOK_STATUS.get(payload.get("hook_event_name"))
         if not status:
             return
-        ws, nome = agent_by(payload.get("session_id"),
+        ws, name = agent_by(payload.get("session_id"),
                             os.environ.get("TMUX_PANE"))
         if ws:
-            set_status(ws, nome, status)
+            set_status(ws, name, status)
     except Exception:
         return
 
 
 def cmd_read(args):
     _, reg = find_agent(args.name)
-    # Armadilha 2: capture-pane logo depois de escrever devolve o frame
-    # anterior. Le duas vezes; a segunda e' a boa.
+    # Pitfall 2: capture-pane right after writing returns the previous frame.
+    # Read twice; the second one is the good one.
     tmux("capture-pane", "-p", "-t", reg["pane"], "-S", f"-{args.lines}")
     out = tmux("capture-pane", "-p", "-t", reg["pane"], "-S", f"-{args.lines}")
     print(out.stdout.rstrip())
@@ -1145,22 +1196,22 @@ def cmd_kill(args):
         st.get("agents", {}).pop(args.name, None)
     update_state(ws, mutate)
     log_event(cmd="kill", ws=ws, name=args.name, pane=reg["pane"], ok=True)
-    print(f"{args.name} ({reg['pane']}) morto")
+    print(f"{args.name} ({reg['pane']}) killed")
 
 
 def cmd_resurrect(args):
-    """Worktree vivo no disco que perdeu a janela — o caso classico e' reboot,
-    que leva o servidor tmux inteiro e nao encosta em nada do git.
+    """A worktree alive on disk that lost its window -- the classic case is a
+    reboot, which takes the whole tmux server and touches nothing in git.
 
-    NAO ressuscita agente: a janela volta com shell puro. Quem quer agente
-    chama `spawn`, porque decidir quais agentes valia subir de novo, e com que
-    prompt, e' julgamento — e julgamento e' trabalho de agente lendo o log,
-    nao de comando.
+    It does NOT resurrect agents: the window comes back with a plain shell.
+    Whoever wants an agent calls `spawn`, because deciding which agents were
+    worth bringing back, and with what prompt, is judgement -- and judgement is
+    the work of an agent reading the log, not of a command.
     """
     _ws = ws_arg(args)
     workspaces = [_ws] if _ws else sorted(
         p.stem for p in WORKSPACES.glob("*.yml")) if WORKSPACES.exists() else []
-    plano, orfaos = [], []
+    plano, orphans = [], []
     for ws in workspaces:
         try:
             cfg = workspace_config(ws)
@@ -1170,17 +1221,17 @@ def cmd_resurrect(args):
         state = read_state(ws)
         root = expand(cfg.get("worktrees") or "~/wt")
 
-        # 1. o registro
-        cands = {w: dict(m, origem="registro")
+        # 1. the registry
+        cands = {w: dict(m, source="registry")
                  for w, m in (state.get("worktrees") or {}).items()}
 
-        # 2. o git, que pega o que o registro perdeu
+        # 2. git, which catches what the registry lost
         for repo, rp in (cfg.get("repos") or {}).items():
             try:
-                conhecidos = git_worktrees(expand(rp))
+                known = git_worktrees(expand(rp))
             except OrqError:
                 continue
-            for wt in conhecidos:
+            for wt in known:
                 try:
                     rel = wt["path"].relative_to(root / repo)
                 except ValueError:
@@ -1189,226 +1240,234 @@ def cmd_resurrect(args):
                 if window not in cands:
                     cands[window] = {"repo": repo, "slug": rel.as_posix(),
                                      "branch": wt.get("branch"),
-                                     "path": str(wt["path"]), "origem": "git"}
+                                     "path": str(wt["path"]), "source": "git"}
 
         vivas = {p["window"] for p in list_panes(session)} if session_exists(session) else set()
         for window, meta in sorted(cands.items()):
             if not Path(meta["path"]).exists():
-                orfaos.append((ws, window, meta["path"], meta["origem"], cfg))
+                orphans.append((ws, window, meta["path"], meta["source"], cfg))
                 continue
             if window in vivas:
                 continue
             plano.append((ws, session, window, meta))
 
-    for ws, window, path, origem, _ in orfaos:
-        print(f"  ignorado  {ws}  {window}  (path sumiu: {path})")
+    for ws, window, path, source, _ in orphans:
+        print(f"  skipped  {ws}  {window}  (path is gone: {path})")
 
-    # Limpeza preguicosa, mesmo principio do pane morto. Mas so vale pro que
-    # veio do REGISTRO: orfao que o `git worktree list` ainda fornece volta na
-    # proxima execucao, e podar o registro nao o remove. Esse e' `git worktree
-    # prune`, que mexe no repo do usuario — entao o orq aponta, nao executa.
-    do_registro = [o for o in orfaos if o[3] == "registro"]
-    do_git = [o for o in orfaos if o[3] == "git"]
-    if do_registro and not args.dry_run:
-        for ws in {o[0] for o in do_registro}:
-            mortos = {o[1] for o in do_registro if o[0] == ws}
-            def mutate(state, m=mortos):
+    # Lazy cleanup, same principle as the dead pane. But it only applies to
+    # what came from the REGISTRY: an orphan `git worktree list` still reports
+    # comes back on the next run, and pruning the registry does not remove it.
+    # That is `git worktree prune`, which touches the user's repo -- so orq
+    # points at it instead of running it.
+    from_registry = [o for o in orphans if o[3] == "registry"]
+    do_git = [o for o in orphans if o[3] == "git"]
+    if from_registry and not args.dry_run:
+        for ws in {o[0] for o in from_registry}:
+            dead = {o[1] for o in from_registry if o[0] == ws}
+            def mutate(state, m=dead):
                 for win in m:
                     state.get("worktrees", {}).pop(win, None)
             update_state(ws, mutate)
-            log_event(cmd="resurrect", ws=ws, pruned=sorted(mortos), ok=True)
-        print(f"  ({len(do_registro)} entrada(s) removida(s) do registro)")
+            log_event(cmd="resurrect", ws=ws, pruned=sorted(dead), ok=True)
+        print(f"  ({len(from_registry)} stale entr(y/ies) pruned from the registry)")
     if do_git:
         repos = sorted({str(expand(o[4].get("repos", {}).get(o[1].split("/")[0], "?")))
                         for o in do_git})
-        print(f"  o git ainda lista esse(s) path(s); pra parar de avisar rode:")
+        print(f"  git still lists that path; to stop the warning run:")
         for r in repos:
             print(f"    git -C {r} worktree prune")
     if not plano:
-        print("nada a ressuscitar")
+        print("nothing to resurrect")
         return
     if args.dry_run:
         for ws, session, window, meta in plano:
-            marca = "" if meta["origem"] == "registro" else "  [so o git sabia]"
-            print(f"  seria recriada  {ws}:{window}  "
-                  f"[{meta.get('branch') or '?'}]{marca}")
+            mark = "" if meta["source"] == "registry" else "  [only git knew]"
+            print(f"  would recreate  {ws}:{window}  "
+                  f"[{meta.get('branch') or '?'}]{mark}")
         return
 
     for ws, session, window, meta in plano:
         if not session_exists(session):
             cmd_up(argparse.Namespace(ws=ws), quiet=True)
-            print(f"  sessao '{session}' recriada")
+            print(f"  session '{session}' recreated")
         tmux("new-window", "-d", "-t", f"={session}", "-n", window,
              "-c", meta["path"])
-        if meta["origem"] == "git":
+        if meta["source"] == "git":
             def mutate(state, w=window, m=meta):
                 state.setdefault("worktrees", {})[w] = {
-                    k: v for k, v in m.items() if k != "origem"}
+                    k: v for k, v in m.items() if k != "source"}
             update_state(ws, mutate)
         log_event(cmd="resurrect", ws=ws, wt=window, path=meta["path"],
-                  origem=meta["origem"], ok=True)
-        marca = "" if meta["origem"] == "registro" else "  [so o git sabia]"
-        print(f"  recriada  {ws}:{window}  [{meta.get('branch') or '?'}]{marca}")
+                  source=meta["source"], ok=True)
+        mark = "" if meta["source"] == "registry" else "  [only git knew]"
+        print(f"  recriada  {ws}:{window}  [{meta.get('branch') or '?'}]{mark}")
 
 
 def fmt_pane(p):
-    nome = p["name"] or "-"
-    pai = f" <- {p['parent']}" if p["parent"] else ""
+    name = p["name"] or "-"
+    parent_ = f" <- {p['parent']}" if p["parent"] else ""
     sil = " zzz" if p["silence"] else ""
     st = f" [{p['status']}]" if p.get("status") else ""
-    return f"    {p['pane']}  {nome}  {p['command']}{pai}{st}{sil}"
+    return f"    {p['pane']}  {name}  {p['command']}{parent_}{st}{sil}"
 
 
 def cmd_schedule_add(args):
     if not NAME_RE.match(args.name):
-        raise OrqError(f"nome invalido: '{args.name}' (esperado {NAME_RE.pattern})")
+        raise OrqError(f"invalid name: '{args.name}' (expected {NAME_RE.pattern})")
     if "/" in args.name:
-        raise OrqError("nome de schedule nao aceita `/` (vira nome de unidade)")
+        raise OrqError("a schedule name cannot contain `/` (it becomes a unit name)")
     if not args.command:
-        raise OrqError("falta o comando: `orq schedule add <nome> --cron '…' -- <comando>`")
+        raise OrqError("missing command: `orq schedule add <name> --cron '…' -- <command>`")
     if bool(args.cron) == bool(args.calendar):
-        raise OrqError("passe --cron OU --calendar, nao os dois nem nenhum")
+        raise OrqError("pass --cron OR --calendar, not both and not neither")
 
-    existentes = sched_units()
-    if args.name in existentes:
-        raise OrqError(f"schedule '{args.name}' ja existe — `orq schedule rm` antes")
-    if len(existentes) >= SCHED_MAX:
-        raise OrqError(f"teto de {SCHED_MAX} schedules atingido ({len(existentes)} ativos). "
-                       f"remova algum antes — acumulo silencioso e' o risco real aqui")
+    existing = sched_units()
+    if args.name in existing:
+        raise OrqError(f"schedule '{args.name}' already exists -- `orq schedule rm` it first")
+    if len(existing) >= SCHED_MAX:
+        raise OrqError(f"ceiling of {SCHED_MAX} schedules reached ({len(existing)} active). "
+                       f"remove one first -- silent accumulation is the real risk here")
 
     tz = orq_timezone()
-    calendario = args.calendar or cron_to_calendar(args.cron, tz)
-    proxima = calendar_next(calendario)          # valida antes de escrever
+    calendar = args.calendar or cron_to_calendar(args.cron, tz)
+    next_at = calendar_next(calendar)          # validate before writing anything
 
-    # shlex.join, nao " ".join: o shell do usuario ja tirou as aspas, entao
-    # juntar com espaco quebra qualquer argumento que tinha espaco dentro --
-    # `claude -p "prompt longo"` viraria varios argumentos. shlex.join
-    # reconstroi uma linha de shell equivalente ao argv original.
+    # shlex.join, not " ".join: the user's shell already stripped the quotes,
+    # so joining on spaces breaks any argument that had a space inside --
+    # `claude -p "long prompt"` would become several arguments. shlex.join
+    # rebuilds a shell line equivalent to the original argv.
     cmd = shlex.join(args.command)
     ws = ws_arg(args)
-    criador = caller_agent() or "humano"
+    creator = caller_agent() or "human"
     agora = datetime.now(timezone.utc).astimezone().isoformat()
     wd = str(lead_root(workspace_config(ws))) if ws else str(expand("~"))
 
     UNITS.mkdir(parents=True, exist_ok=True)
-    unidade = f"{SCHED_PREFIX}{args.name}"
-    # As linhas `# orq:` sao o registro. Nao ha copia em ~/.orq/ pra divergir.
-    (UNITS / f"{unidade}.service").write_text(
+    unit = f"{SCHED_PREFIX}{args.name}"
+    # The `# orq:` lines ARE the registry. No copy under ~/.orq/ to drift.
+    title = f"orq schedule: {args.name}"
+    if args.desc:
+        title += f" — {args.desc}"
+    (UNITS / f"{unit}.service").write_text(
         f"[Unit]\n"
-        f"Description=orq schedule: {args.name}\n"
-        f"# orq: nome={args.name}  ws={ws or '-'}  criador={criador}  em={agora}\n"
-        f"# orq: calendario={calendario}\n"
+        f"Description={title}\n"
+        f"# orq: name={args.name}  ws={ws or '-'}  creator={creator}  em={agora}\n"
+        f"# orq: calendar={calendar}\n"
         f"\n[Service]\n"
         f"Type=oneshot\n"
         f"WorkingDirectory={wd}\n"
-        # Duas armadilhas do ExecStart, ambas silenciosas:
-        # 1. NAO roda shell -- aspas, pipe e redirecionamento morreriam. Dai o
-        #    wrap em `bash -lc`, mesma familia do wrap do `--cmd`.
-        # 2. `%` e' ESPECIFICADOR do systemd e e' expandido antes do bash ver.
-        #    Medido: `$(date +%T)` virou `$(date +/tmp)` porque %T e' o
-        #    diretorio temporario. Dobrar e' o escape.
+        # Two ExecStart pitfalls, both silent:
+        # 1. It does NOT run a shell -- quotes, pipes and redirection would
+        #    die. Hence the `bash -lc` wrap, same family as the `--cmd` wrap.
+        # 2. `%` is a systemd SPECIFIER, expanded before bash ever sees it.
+        #    Measured: `$(date +%T)` ran as `$(date +/tmp)` because %T is the
+        #    temporary directory. Doubling it is the escape.
         f"ExecStart=/bin/bash -lc "
         f"{shlex.quote(cmd).replace('%', '%%')}\n"
     )
-    (UNITS / f"{unidade}.timer").write_text(
+    (UNITS / f"{unit}.timer").write_text(
         f"[Unit]\n"
-        f"Description=orq schedule: {args.name}\n"
+        f"Description={title}\n"
         f"\n[Timer]\n"
-        f"OnCalendar={calendario}\n"
+        f"OnCalendar={calendar}\n"
         f"Persistent=true\n"
         f"\n[Install]\n"
         f"WantedBy=timers.target\n"
     )
     systemctl("daemon-reload")
-    systemctl("enable", "--now", f"{unidade}.timer")
+    systemctl("enable", "--now", f"{unit}.timer")
 
-    # Write-through: loga DEPOIS que o systemd confirmou, pra o log nunca
-    # afirmar algo que nao existe.
-    log_event(cmd="schedule add", name=args.name, ws=ws, criador=criador,
-              calendario=calendario, comando=cmd, next=proxima, ok=True)
-    print(f"{args.name}  ->  {unidade}.timer")
-    print(f"  quando: {calendario}")
-    print(f"  proxima execucao: {proxima}")
-    print(f"  comando: {cmd}")
+    # Write-through: log AFTER systemd confirmed, so the log never asserts
+    # something that does not exist.
+    log_event(cmd="schedule add", name=args.name, ws=ws, creator=creator,
+              calendar=calendar, command_str=cmd, next=next_at, ok=True)
+    print(f"{args.name}  ->  {unit}.timer")
+    print(f"  when: {calendar}")
+    print(f"  next run: {next_at}")
+    if args.desc:
+        print(f"  description: {args.desc}")
+    print(f"  command: {cmd}")
 
 
 def schedule_rows(ws=None):
     """Linhas de schedule, lidas do systemd. Compartilhado pelo `schedule ls`
     e pelo `ls` -- o plano quer schedule e workspace na MESMA dashboard."""
-    linhas = []
-    for nome in sched_units():
-        unidade = f"{SCHED_PREFIX}{nome}"
-        props = systemctl("show", f"{unidade}.timer", "--property=NextElapseUSecRealtime",
+    rows = []
+    for name in sched_units():
+        unit = f"{SCHED_PREFIX}{name}"
+        props = systemctl("show", f"{unit}.timer", "--property=NextElapseUSecRealtime",
                           "--property=LastTriggerUSec", "--property=ActiveState",
                           check=False).stdout
         d = dict(l.split("=", 1) for l in props.splitlines() if "=" in l)
-        meta = sched_meta(nome)
-        linhas.append({
-            "name": nome, "unit": f"{unidade}.timer",
+        meta = sched_meta(name)
+        rows.append({
+            "name": name, "unit": f"{unit}.timer",
             "state": d.get("ActiveState"),
             "next": d.get("NextElapseUSecRealtime") or None,
             "last": d.get("LastTriggerUSec") or None,
-            # `-` e' o marcador de vazio na unidade (texto); no JSON vira null
+            # `-` is the empty marker in the unit (text); in JSON it is null
             "ws": (meta.get("ws") or None) if meta.get("ws") != "-" else None,
-            "criador": meta.get("criador"),
-            "calendario": meta.get("calendario"), "exec": meta.get("exec"),
+            "creator": meta.get("creator"),
+            "calendar": meta.get("calendar"), "exec": meta.get("exec"),
+            "desc": meta.get("desc") or "",
         })
     if ws:
-        linhas = [l for l in linhas if l["ws"] == ws]
-    return linhas
+        rows = [l for l in rows if l["ws"] == ws]
+    return rows
 
 
 def fmt_schedule(s_, indent="  "):
-    marca = "" if s_["state"] == "active" else f"  ({s_['state']})"
-    out = [f"{s_['name']}{marca}",
-           f"{indent}quando: {s_['calendario'] or '?'}",
-           f"{indent}proxima: {s_['next'] or '-'}"]
+    mark = "" if s_["state"] == "active" else f"  ({s_['state']})"
+    out = [f"{s_['name']}{mark}" + (f"  — {s_['desc']}" if s_.get("desc") else ""),
+           f"{indent}when: {s_['calendar'] or '?'}",
+           f"{indent}next: {s_['next'] or '-'}"]
     if s_["last"]:
-        out.append(f"{indent}ultima: {s_['last']}")
-    out.append(f"{indent}criador: {s_['criador'] or '?'}   ws: {s_['ws'] or '-'}")
+        out.append(f"{indent}last: {s_['last']}")
+    out.append(f"{indent}creator: {s_['creator'] or '?'}   ws: {s_['ws'] or '-'}")
     out.append(f"{indent}exec: {s_['exec'] or '?'}")
     return "\n".join(out)
 
 
 def cmd_schedule_ls(args):
-    linhas = schedule_rows()
+    rows = schedule_rows()
     if args.json:
-        print(json.dumps(linhas, indent=2, ensure_ascii=False))
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
         return
-    if not linhas:
-        print("nenhum schedule")
+    if not rows:
+        print("no schedules")
         return
-    for s_ in linhas:
+    for s_ in rows:
         print(fmt_schedule(s_))
 
 
 def cmd_schedule_rm(args):
     if args.name not in sched_units():
-        raise OrqError(f"schedule '{args.name}' nao existe")
-    unidade = f"{SCHED_PREFIX}{args.name}"
-    systemctl("disable", "--now", f"{unidade}.timer", check=False)
+        raise OrqError(f"schedule '{args.name}' does not exist")
+    unit = f"{SCHED_PREFIX}{args.name}"
+    systemctl("disable", "--now", f"{unit}.timer", check=False)
     for sufixo in (".timer", ".service"):
-        alvo = UNITS / f"{unidade}{sufixo}"
-        if alvo.exists():
-            alvo.unlink()
+        target = UNITS / f"{unit}{sufixo}"
+        if target.exists():
+            target.unlink()
     systemctl("daemon-reload")
     log_event(cmd="schedule rm", name=args.name,
-              criador=caller_agent() or "humano", ok=True)
-    print(f"{args.name} removido")
+              creator=caller_agent() or "human", ok=True)
+    print(f"{args.name} removed")
 
 
 def cmd_schedule_run(args):
     if args.name not in sched_units():
-        raise OrqError(f"schedule '{args.name}' nao existe")
-    unidade = f"{SCHED_PREFIX}{args.name}"
-    systemctl("start", f"{unidade}.service")
+        raise OrqError(f"schedule '{args.name}' does not exist")
+    unit = f"{SCHED_PREFIX}{args.name}"
+    systemctl("start", f"{unit}.service")
     log_event(cmd="schedule run", name=args.name,
-              criador=caller_agent() or "humano", ok=True)
-    print(f"{args.name} disparado agora (fora da agenda)")
+              creator=caller_agent() or "human", ok=True)
+    print(f"{args.name} fired now (off schedule)")
 
 
-def cmd_ls(args):
-    _ws = ws_arg(args)
+def ls_tree(_ws=None):
+    """The workspace -> worktree -> panes tree. Extracted from `ls` so that
+    `dash` reads the SAME source -- built separately, the two would drift."""
     workspaces = [_ws] if _ws else sorted(
         p.stem for p in WORKSPACES.glob("*.yml")
     ) if WORKSPACES.exists() else []
@@ -1421,43 +1480,45 @@ def cmd_ls(args):
         session = cfg.get("session") or ws
         state = read_state(ws)
         panes = list_panes(session) if session_exists(session) else []
-        agentes = state.get("agents", {})
-        # Detalhe #6: limpeza preguicosa. Pane morto vira nome orfao; some no
-        # proximo `ls`. O id NUNCA e' reciclado — pane novo com nome antigo
-        # seria mandar prompt pro agente errado.
+        agents = state.get("agents", {})
+        # Detail #6: lazy cleanup. A dead pane leaves an orphan name; it goes
+        # away on the next `ls`. The id is NEVER recycled -- a new pane under an
+        # old name would mean sending a prompt to the wrong agent.
         if session_exists(session):
-            vivos = all_pane_ids()
-            mortos = [n for n, a in agentes.items() if a.get("pane") not in vivos]
-            if mortos:
-                def limpa(st, m=mortos):
+            alive = all_pane_ids()
+            dead = [n for n, a in agents.items() if a.get("pane") not in alive]
+            if dead:
+                def limpa(st, m=dead):
                     for n in m:
                         st.get("agents", {}).pop(n, None)
                 update_state(ws, limpa)
-                agentes = {n: a for n, a in agentes.items() if n not in mortos}
-        janelas = {}
+                agents = {n: a for n, a in agents.items() if n not in dead}
+        windows = {}
         for p in panes:
-            reg = next((dict(a, name=n) for n, a in agentes.items()
+            reg = next((dict(a, name=n) for n, a in agents.items()
                         if a.get("pane") == p["pane"]), None)
-            janelas.setdefault(p["window"], []).append({
+            windows.setdefault(p["window"], []).append({
                 "pane": p["pane"],
                 "name": reg["name"] if reg else None,
                 "provider": reg.get("provider") if reg else None,
                 "parent": reg.get("parent") if reg else None,
-                # `done` nao mata o pane, entao "pane vivo" nao distingue mais
-                # trabalhando de terminado. O status e' o que distingue.
+                # `done` does not kill the pane, so "pane alive" no longer
+                # tells working from finished. The status is what does.
                 "status": reg.get("status") if reg else None,
-                # o comando real da arvore; `pane_current_command` reporta o
-                # shell pros panes de split-window e mentia na tela.
+                # when the status changed; `dash` derives "how long ago"
+                "status_at": reg.get("status_at") if reg else None,
+                # the real command from the tree; `pane_current_command`
+                # reports the shell for split-window panes and lied on screen.
                 "command": next((c for c in p["procs"] if c not in SHELLS),
                                 p["command"]),
-                # O flag de silencio vem cru do tmux: repassar o dado nao e'
-                # construir deteccao de ociosidade (que foi cortada).
+                # The silence flag comes raw from tmux: passing the datum
+                # through is not building idle detection (which was cut).
                 "silence": p["silence"] == "1",
             })
-        # Fora antes do laco de worktrees: _lead nao e' worktree, e sem tirar
-        # daqui ele cairia no balde de "janela sem registro" e seria anunciado
-        # como worktree desconhecido.
-        lead = janelas.pop(LEAD_WINDOW, [])
+        # Pulled out before the worktree loop: _lead is not a worktree, and
+        # without removing it here it would fall into the "unregistered window"
+        # bucket and be announced as an unknown worktree.
+        lead = windows.pop(LEAD_WINDOW, [])
         wts = []
         for window, meta in sorted(state.get("worktrees", {}).items()):
             path = Path(meta["path"])
@@ -1467,46 +1528,52 @@ def cmd_ls(args):
                 "path": meta["path"],
                 "exists": path.exists(),
                 "dirty": is_dirty(path, meta.get("orq_files")) if path.exists() else None,
-                "window_alive": window in janelas,
-                "panes": janelas.pop(window, []),
+                "window_alive": window in windows,
+                "panes": windows.pop(window, []),
             })
-        for window, panes_ in sorted(janelas.items()):   # janela sem registro
+        for window, panes_ in sorted(windows.items()):   # window sem registro
             wts.append({"worktree": window, "branch": None, "path": None,
                         "exists": None, "dirty": None, "window_alive": True,
                         "panes": panes_, "unregistered": True})
         tree.append({"workspace": ws, "session": session,
                      "session_alive": session_exists(session),
-                     # os repos configurados sao o que se pode passar como
-                     # <repo> no `wt new` — e' a informacao que se olha logo
-                     # antes de criar worktree, entao mora aqui e nao num
-                     # comando novo.
+                     # the configured repos are what you can pass as <repo>
+                     # to `wt new` -- it is what you look at right before
+                     # creating a worktree, so it lives here instead of in a
+                     # new command.
                      "repos": {k: str(expand(v))
                                for k, v in (cfg.get("repos") or {}).items()},
-                     # o `root:` sai cru, sem validar: `ls` e' leitura, quem
-                     # recusa root inexistente e' o `up` e o `spawn`.
+                     # `root:` goes out raw, unvalidated: `ls` is a read; the
+                     # ones that refuse a missing root are `up` and `spawn`.
                      "lead": {"window": LEAD_WINDOW,
                               "root": str(expand(cfg.get("root") or "~")),
                               "panes": lead},
                      "worktrees": wts})
+    return tree
 
-    # Schedules entram na MESMA saida dos workspaces: e' a dashboard unica que
-    # o plano pede, e o contrato "nada de estado so dentro da CLI" vale pra
-    # eles tambem. Filtrados pelo workspace quando um foi pedido.
+
+def cmd_ls(args):
+    _ws = ws_arg(args)
+    tree = ls_tree(_ws)
+
+    # Schedules go into the SAME output as the workspaces: it is the single
+    # dashboard the plan asks for, and the "no state lives only inside the CLI"
+    # contract applies to them too. Filtered by workspace when one was asked for.
     scheds = schedule_rows(ws=_ws)
 
     if args.json:
-        # ⚠️ Mudanca de forma: o topo era uma LISTA de workspaces e passa a ser
-        # um objeto com `workspaces` e `schedules`. Feito agora porque a TUI da
-        # Fase 5 ainda nao existe pra quebrar.
+        # Shape change: the top level used to be a LIST of workspaces and is
+        # now an object with `workspaces` and `schedules`. Done now because the
+        # Phase 5 TUI does not exist yet to break.
         print(json.dumps({"workspaces": tree, "schedules": scheds},
                          indent=2, ensure_ascii=False))
         return
     if not tree and not scheds:
-        print("nenhum workspace em " + str(WORKSPACES))
+        print("no workspaces in " + str(WORKSPACES))
         return
     for ws in tree:
-        marca = "" if ws["session_alive"] else "  (sessao morta)"
-        print(f"{ws['workspace']}{marca}")
+        mark = "" if ws["session_alive"] else "  (session dead)"
+        print(f"{ws['workspace']}{mark}")
         if ws["repos"]:
             print(f"  repos: {', '.join(sorted(ws['repos']))}")
         if ws["lead"]["panes"]:
@@ -1515,14 +1582,14 @@ def cmd_ls(args):
                 print(fmt_pane(p))
         for wt in ws["worktrees"]:
             sujo = " *" if wt["dirty"] else ""
-            avisos = []
+            notes = []
             if wt["exists"] is False:
-                avisos.append("path sumiu")
+                notes.append("path gone")
             elif not wt["window_alive"]:
-                # worktree vivo que perdeu a janela: e' o caso do `resurrect`.
-                avisos.append("sem janela — `orq resurrect`")
-            aviso = f"  ({'; '.join(avisos)})" if avisos else ""
-            print(f"  {wt['worktree']}  [{wt['branch'] or '?'}]{sujo}{aviso}")
+                # worktree vivo que perdeu a window: e' o caso do `resurrect`.
+                notes.append("no window -- `orq resurrect`")
+            note = f"  ({'; '.join(notes)})" if notes else ""
+            print(f"  {wt['worktree']}  [{wt['branch'] or '?'}]{sujo}{note}")
             for p in wt["panes"]:
                 print(fmt_pane(p))
 
@@ -1530,6 +1597,268 @@ def cmd_ls(args):
         print("schedules")
         for s_ in scheds:
             print("  " + fmt_schedule(s_, indent="  ").replace("\n", "\n  "))
+
+
+# --- dash: TUI read-only ----------------------------------------------------
+#
+# READ-ONLY by the user's decision (2026-08-30): the TUI never sends anything.
+# The one who types is him, inside tmux. So it needs exactly two things -- the
+# tree `ls` already builds, and `tmux switch-client`. No input box, no `send`,
+# no `keys`. That is what keeps it cheap, and what stops orq from growing a
+# second place where state lives.
+
+DASH_REFRESH_S = 2.0
+
+
+def age_since(iso):
+    """'12m', '3h', '2d' -- the most useful number for whoever is orchestrating,
+    because it is how a stuck agent becomes visible. `ls` deliberately does not
+    carry it: it is derived, and derived belongs to the presentation."""
+    if not iso:
+        return ""
+    try:
+        delta = datetime.now(timezone.utc) - datetime.fromisoformat(iso).astimezone(timezone.utc)
+    except ValueError:
+        return ""
+    seg = int(delta.total_seconds())
+    if seg < 60:
+        return f"{seg}s"
+    if seg < 3600:
+        return f"{seg // 60}m"
+    if seg < 86400:
+        return f"{seg // 3600}h"
+    return f"{seg // 86400}d"
+
+
+def when_short(ts):
+    """`Wed 2026-09-02 08:03:00 -03` -> `wed 08:03`, and `today 19:03` when it
+    is today. The full date neither fits nor informs: what you look for on a
+    panel is whether it is today, and at what time."""
+    if not ts or ts == "-":
+        return "-"
+    # O systemd imprime o fuso como `-03`, e `%z` do strptime quer `-0300`.
+    body = " ".join(ts.split()[:3])          # descarta o offset
+    try:
+        d = datetime.strptime(body, "%a %Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return ts[:16]
+    hoje = datetime.now().date()
+    days = (d.date() - hoje).days
+    dia = {0: "today", 1: "tomorrow"}.get(
+        days, ["mon", "tue", "wed", "thu", "fri", "sat", "sun"][d.weekday()])
+    return f"{dia} {d:%H:%M}"
+
+
+def sched_cmd(execstart):
+    """`/bin/bash -lc 'cmd'` -> `cmd`. The wrapper is a detail of how systemd
+    executes, not information for whoever is looking at the panel."""
+    if not execstart:
+        return ""
+    try:
+        parts = shlex.split(execstart)
+    except ValueError:
+        return execstart
+    return parts[-1] if parts else execstart
+
+
+def sched_result(name):
+    """Result of the LAST run. `schedule ls` shows the timer's state, which does
+    not say whether the job passed or broke -- a schedule that fails every day
+    looks healthy there."""
+    r = systemctl("show", f"{SCHED_PREFIX}{name}.service",
+                  "--property=Result", "--property=ExecMainStatus",
+                  "--property=ExecMainStartTimestamp", check=False)
+    d = dict(l.split("=", 1) for l in r.stdout.splitlines() if "=" in l)
+    # `ActiveEnterTimestamp` is NO USE here: a Type=oneshot goes inactive
+    # immediately and never fills it in, not even on success -- the first
+    # version of this returned "-" for everything, including the job that had
+    # just failed. The one that says "it already ran" is ExecMainStartTimestamp.
+    if not d.get("ExecMainStartTimestamp"):
+        return "-"
+    if d.get("Result") == "success":
+        return "ok"
+    return f"{d.get('Result') or '?'} ({d.get('ExecMainStatus')})"
+
+
+def dash_rows(_ws, width=100):
+    """Rows ready to draw: (kind, left, right, target, color).
+
+    `left` and `right` are pinned to the two edges by the renderer, so the full
+    width of the screen is used instead of everything crammed to the left.
+    """
+    rows = []
+    tree = ls_tree(_ws)
+    scheds = schedule_rows(ws=_ws)
+
+    for w in tree:
+        panes_todos = [p for wt in w["worktrees"] for p in wt["panes"]] + w["lead"]["panes"]
+        working = sum(1 for p in panes_todos if p.get("status") == "working")
+        agents = sum(1 for p in panes_todos if p.get("name"))
+        state_txt = "session alive" if w["session_alive"] else "SESSION DEAD"
+        rows.append(("head", f" {w['workspace']} ",
+                       f"{state_txt} · {agents} agent(s) · {working} working ",
+                       None, "ok" if w["session_alive"] else "bad"))
+
+        rows.append(("colhead",
+                       f"    {'':2}{'agent':<16}{'process':<10}{'state':<9}"
+                       f"{'age':>5}",
+                       "parent · pane ", None, "dim"))
+        groups = [(w["lead"]["window"], None, w["lead"]["panes"], w["lead"]["root"])]
+        for wt in w["worktrees"]:
+            notes = []
+            if wt["exists"] is False:
+                notes.append("path gone")
+            elif not wt["window_alive"]:
+                notes.append("no window · orq resurrect")
+            if wt["dirty"]:
+                notes.append("dirty")
+            groups.append((wt["worktree"], wt["branch"], wt["panes"],
+                           " · ".join(notes)))
+
+        for window, branch, panes, nota in groups:
+            left = f"  {window}" + (f"  [{branch}]" if branch else "")
+            color = "bad" if "sem window" in (nota or "") else "dim"
+            rows.append(("sub", left, (nota or "") + " ", None, color))
+            for pane in panes:
+                name = pane["name"]
+                st = pane.get("status") or ""
+                color = {"working": "warn", "done": "ok"}.get(st, "dim")
+                age = age_since(pane.get("status_at"))
+                left = (f"    {'●' if name else '○'} {(name or '-'):<16}"
+                       f"{pane['command']:<10}{st:<9}{age:>5}")
+                right = (f"{pane['parent'] + ' <- ' if pane.get('parent') else ''}"
+                        f"{pane['pane']} ")
+                target = f"{w['session']}:{window}.{pane['pane']}" if w["session_alive"] else None
+                rows.append(("pane", left, right, target, color))
+        rows.append(("gap", "", "", None, "dim"))
+
+    rows.append(("head", " schedules ",
+                   f"{len(scheds)} scheduled " if scheds else "none ",
+                   None, "ok"))
+    # Description width derived from the screen: 4 of indent + 16 for the name
+    # + 14 for the next run + 16 for the result, minus the right-hand column.
+    col_desc = max(12, width - 50 - 12)
+    if scheds:
+        rows.append(("colhead",
+                       f"    {'name':<16}{'next run':<14}{'last run':<16}"
+                       f"{'what it does':<{col_desc}}",
+                       "workspace ", None, "dim"))
+    for sc in scheds:
+        res = sched_result(sc["name"])
+        color = {"ok": "ok", "-": "dim"}.get(res, "bad")
+        # the description, when present, is what the person meant to say; the
+        # command is the technical detail and becomes the fallback.
+        what = sc.get("desc") or sched_cmd(sc["exec"])
+        if len(what) > col_desc:
+            what = what[:col_desc - 1] + "…"
+        left = (f"    {sc['name']:<16}{when_short(sc['next']):<14}"
+               f"{res:<16}{what:<{col_desc}}")
+        mark = ("global" if not sc["ws"] else sc["ws"])
+        rows.append(("sched", left, mark + " ", None, color))
+    return rows
+
+
+def cmd_dash(args):
+    _ws = ws_arg(args)
+
+    def loop(screen):
+        curses.curs_set(0)
+        # The keyboard answers in 80ms; the DATA is rebuilt every
+        # DASH_REFRESH_S. Before, the rebuild happened on every keystroke and
+        # navigation carried the full 227ms of collection.
+        screen.timeout(80)
+        colors = {}
+        if curses.has_colors():
+            curses.start_color()
+            curses.use_default_colors()
+            for i, (name, color) in enumerate(
+                    [("ok", curses.COLOR_GREEN), ("warn", curses.COLOR_YELLOW),
+                     ("bad", curses.COLOR_RED), ("dim", -1),
+                     ("bar", curses.COLOR_CYAN)], start=1):
+                curses.init_pair(i, color, -1)
+                colors[name] = curses.color_pair(i)
+
+        rows, next_at, sel, top, err = [], 0.0, 0, 0, None
+        last_width = 0
+        while True:
+            agora = time.monotonic()
+            height, width = screen.getmaxyx()
+            if agora >= next_at or width != last_width:
+                last_width = width
+                try:
+                    rows, err = dash_rows(_ws, width), None
+                except OrqError as e:
+                    rows, err = [], str(e)
+                next_at = agora + DASH_REFRESH_S
+
+            selectable = [i for i, l in enumerate(rows) if l[0] in ("pane", "sched")]
+            if selectable:
+                sel = max(0, min(sel, len(selectable) - 1))
+
+            screen.erase()
+            body = height - 2
+
+            def draw_row(y, left, right, attr):
+                espaco = width - len(left) - len(right)
+                text = left + (" " * espaco + right if espaco > 0 else "")
+                try:
+                    screen.addnstr(y, 0, text.ljust(width)[:width - 1], width - 1, attr)
+                except curses.error:
+                    pass
+
+            title = f" orq · {_ws or 'all workspaces'}"
+            draw_row(0, title, time.strftime("%H:%M:%S "),
+                    curses.A_REVERSE | curses.A_BOLD)
+
+            if selectable:
+                pos = selectable[sel]
+                top = min(top, pos)
+                top = max(top, pos - body + 2)
+            top = max(0, min(top, max(0, len(rows) - body + 1)))
+
+            for y, line in enumerate(rows[top:top + body - 1], start=1):
+                kind, left, right, _alvo, color = line
+                idx = top + y - 1
+                attr = colors.get(color, 0)
+                if kind == "head":
+                    attr |= curses.A_BOLD | curses.A_UNDERLINE
+                elif kind == "colhead":
+                    attr |= curses.A_DIM | curses.A_UNDERLINE
+                if selectable and idx == selectable[sel]:
+                    attr |= curses.A_REVERSE
+                draw_row(y, left, right, attr)
+
+            help_line = " j/k move · Enter open · r refresh · q quit"
+            draw_row(height - 1, err or help_line, "read-only ",
+                    curses.A_REVERSE | (colors.get("bad", 0) if err else 0))
+            screen.refresh()
+
+            k = screen.getch()
+            if k == -1:
+                continue
+            if k in (ord("q"), 27):
+                return
+            if k in (ord("j"), curses.KEY_DOWN) and selectable:
+                sel = min(sel + 1, len(selectable) - 1)
+            elif k in (ord("k"), curses.KEY_UP) and selectable:
+                sel = max(sel - 1, 0)
+            elif k == ord("g"):
+                sel, top = 0, 0
+            elif k == ord("G") and selectable:
+                sel = len(selectable) - 1
+            elif k == ord("r"):
+                next_at = 0.0
+            elif k in (10, 13, curses.KEY_ENTER) and selectable:
+                target = rows[selectable[sel]][3]
+                if target:
+                    # The ONLY action of the TUI, and it does not even send
+                    # text: it hands control to tmux and leaves the stage.
+                    tmux("switch-client", "-t", target, check=False)
+                    return
+
+    if not os.environ.get("TMUX"):
+        print("note: outside tmux, Enter cannot switch panes")
+    curses.wrapper(loop)
 
 
 def cmd_log(args):
@@ -1560,23 +1889,23 @@ def build_parser():
     p = argparse.ArgumentParser(prog="orq", description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    # Workspace: posicional OU --ws, em TODOS os comandos que o aceitam.
-    # Antes `up`/`attach` exigiam posicional e o resto so aceitava --ws; a
-    # assimetria era defensavel (um nao tem sessao pra inferir, o outro tem)
-    # mas custava erro de digitacao a quem le -- inclusive a agente lendo o
-    # SKILL.md, onde errar o comando custa um turno. Precedencia:
-    # --ws > posicional > inferido da sessao tmux.
-    sp = sub.add_parser("up", help="cria a sessao do workspace (idempotente)")
+    # Workspace: positional OR --ws, on EVERY command that takes one.
+    # Before, `up`/`attach` required the positional and the rest only accepted
+    # --ws; the asymmetry was defensible (one has no session to infer from, the
+    # other does) but it cost typing errors to whoever reads the surface --
+    # including an agent reading SKILL.md, where a wrong command costs a turn.
+    # Precedence: --ws > positional > inferred from the tmux session.
+    sp = sub.add_parser("up", help="create the workspace session (idempotent)")
     sp.add_argument("ws_pos", nargs="?", metavar="ws")
     sp.add_argument("--ws"); sp.set_defaults(func=cmd_up)
 
-    sp = sub.add_parser("attach", help="tmux attach no workspace")
+    sp = sub.add_parser("attach", help="tmux attach to the workspace")
     sp.add_argument("ws_pos", nargs="?", metavar="ws")
     sp.add_argument("--ws"); sp.set_defaults(func=cmd_attach)
 
     sp = sub.add_parser("wt", help="worktree: new | rm")
     wt = sp.add_subparsers(dest="wt_cmd", required=True)
-    new = wt.add_parser("new", help="cria worktree + janela, base fresca de origin")
+    new = wt.add_parser("new", help="create worktree + window, fresh base from origin")
     new.add_argument("target", help="<repo>/<slug>")
     new.add_argument("ws_pos", nargs="?", metavar="ws")
     new.add_argument("--branch", required=True)
@@ -1584,29 +1913,29 @@ def build_parser():
     new.add_argument("--ws")
     new.add_argument("--no-fetch", action="store_true")
     new.add_argument("--spawn", metavar="PROVIDER",
-                     help="sobe um agente no worktree recem-criado")
-    new.add_argument("--as", dest="as_name", metavar="NOME",
-                     help="nome do agente do --spawn (default: o slug)")
-    new.add_argument("--prompt", help="prompt inicial, com --spawn")
+                     help="start an agent in the freshly created worktree")
+    new.add_argument("--as", dest="as_name", metavar="NAME",
+                     help="name for the --spawn agent (default: the slug)")
+    new.add_argument("--prompt", help="initial prompt, with --spawn")
     new.add_argument("--no-files", action="store_true")
     new.add_argument("--no-hooks", action="store_true")
     new.set_defaults(func=cmd_wt_new)
-    rm = wt.add_parser("rm", help="remove worktree e janela; nunca apaga branch")
+    rm = wt.add_parser("rm", help="remove worktree and window; never deletes the branch")
     rm.add_argument("target")
     rm.add_argument("ws_pos", nargs="?", metavar="ws")
     rm.add_argument("--ws")
     rm.add_argument("--force", action="store_true")
     rm.set_defaults(func=cmd_wt_rm)
 
-    sp = sub.add_parser("resurrect", help="recria janelas que cairam")
+    sp = sub.add_parser("resurrect", help="recreate windows that died")
     sp.add_argument("--dry-run", action="store_true")
     sp.add_argument("ws_pos", nargs="?", metavar="ws")
     sp.add_argument("--ws")
     sp.set_defaults(func=cmd_resurrect)
 
     sp = sub.add_parser("spawn",
-                        help="sobe um terminal/agente num worktree; sem --wt "
-                             "nasce no root do workspace (janela _lead)")
+                        help="start a terminal/agent in a worktree; without --wt "
+                             "it is born at the workspace root (window _lead)")
     sp.add_argument("name"); sp.add_argument("ws_pos", nargs="?", metavar="ws")
     sp.add_argument("--wt")
     sp.add_argument("--provider"); sp.add_argument("--cmd", dest="cmd_str")
@@ -1614,36 +1943,41 @@ def build_parser():
     sp.add_argument("--split", action="store_true"); sp.add_argument("--ws")
     sp.set_defaults(func=cmd_spawn)
 
-    sp = sub.add_parser("kill", help="mata o pane e tira do registro")
+    sp = sub.add_parser("kill", help="kill the pane and drop it from the registry")
     sp.add_argument("name"); sp.set_defaults(func=cmd_kill)
 
-    sp = sub.add_parser("send", help="cola um prompt no pane")
+    sp = sub.add_parser("send", help="paste a prompt into the pane")
     sp.add_argument("name"); sp.add_argument("text")
     sp.add_argument("--no-enter", action="store_true")
     sp.set_defaults(func=cmd_send)
 
-    sp = sub.add_parser("keys", help="manda teclas nomeadas")
+    sp = sub.add_parser("keys", help="send named keys")
     sp.add_argument("name"); sp.add_argument("keys", nargs="+")
     sp.set_defaults(func=cmd_keys)
 
-    sp = sub.add_parser("read", help="capture-pane em texto puro")
+    sp = sub.add_parser("read", help="capture-pane as plain text")
     sp.add_argument("name"); sp.add_argument("--lines", type=int, default=200)
     sp.set_defaults(func=cmd_read)
 
-    sp = sub.add_parser("done", help="fecha o turno: grava status e avisa o pai")
+    sp = sub.add_parser("done", help="close the turn: record status and notify the parent")
     sp.add_argument("msg", nargs="?", default=""); sp.add_argument("--to")
     sp.set_defaults(func=cmd_done)
 
     sp = sub.add_parser("_status",
-                        help="interno: o hook do agente reporta o estado dele")
+                        help="internal: the agent hook reports its own state")
     sp.set_defaults(func=cmd_status_hook)
 
-    sp = sub.add_parser("ls", help="arvore workspace -> worktree -> panes")
+    sp = sub.add_parser("ls", help="tree: workspace -> worktree -> panes")
     sp.add_argument("ws_pos", nargs="?", metavar="ws")
     sp.add_argument("--json", action="store_true"); sp.add_argument("--ws")
     sp.set_defaults(func=cmd_ls)
 
-    sp = sub.add_parser("log", help="filtro sobre o log.jsonl")
+    sp = sub.add_parser("dash", help="read-only TUI over workspaces and schedules")
+    sp.add_argument("ws_pos", nargs="?", metavar="ws")
+    sp.add_argument("--ws")
+    sp.set_defaults(func=cmd_dash)
+
+    sp = sub.add_parser("log", help="filter over log.jsonl")
     sp.add_argument("ws_pos", nargs="?", metavar="ws")
     sp.add_argument("--since"); sp.add_argument("--ws"); sp.add_argument("--action")
     sp.set_defaults(func=cmd_log)
@@ -1652,17 +1986,19 @@ def build_parser():
     sc = sp.add_subparsers(dest="schedule_cmd", required=True)
     add = sc.add_parser("add"); add.add_argument("name")
     add.add_argument("--cron"); add.add_argument("--calendar"); add.add_argument("--ws")
-    # O comando vem depois de `--` e e' separado ANTES do argparse (ver main).
-    # Com nargs=REMAINDER aqui, argparse engolia as proprias flags: um
-    # `add <nome> --cron "…"` virava command=["--cron", "…"] e o --cron nunca
-    # era parseado.
+    add.add_argument("--desc", metavar="TEXTO",
+                     help="short human description, shown in the dash")
+    # The command comes after `--` and is split off BEFORE argparse (see main).
+    # With nargs=REMAINDER here, argparse swallowed orq's own flags: an
+    # `add <name> --cron "…"` became command=["--cron", "…"] and --cron was
+    # never parsed.
     add.add_argument("command", nargs="*", default=[])
     add.set_defaults(func=cmd_schedule_add)
     sls = sc.add_parser("ls"); sls.add_argument("--json", action="store_true")
     sls.set_defaults(func=cmd_schedule_ls)
     srm = sc.add_parser("rm"); srm.add_argument("name")
     srm.set_defaults(func=cmd_schedule_rm)
-    srun = sc.add_parser("run", help="dispara agora, sem esperar a agenda")
+    srun = sc.add_parser("run", help="fire now, without waiting for the schedule")
     srun.add_argument("name")
     srun.set_defaults(func=cmd_schedule_run)
 
@@ -1671,15 +2007,15 @@ def build_parser():
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
-    # `--` separa o comando do usuario dos argumentos do orq. Fica fora do
-    # argparse de proposito: dentro dele, REMAINDER engole flag.
-    resto = None
+    # `--` separates the user's command from orq's own arguments. It is kept
+    # outside argparse on purpose: inside it, REMAINDER swallows flags.
+    rest = None
     if "--" in argv:
-        corte = argv.index("--")
-        argv, resto = argv[:corte], argv[corte + 1:]
+        cut = argv.index("--")
+        argv, rest = argv[:cut], argv[cut + 1:]
     args = build_parser().parse_args(argv)
-    if resto is not None:
-        args.command = resto
+    if rest is not None:
+        args.command = rest
     try:
         args.func(args)
     except OrqError as e:
