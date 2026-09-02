@@ -23,6 +23,7 @@ import json
 import subprocess
 
 from rich.markup import escape
+from rich.text import Text
 from datetime import datetime, timezone
 
 from textual import work
@@ -54,16 +55,24 @@ PREVIEW_LINES = 60
 # against the background it was picked for -- which we no longer own.
 # The light/dark toggle is what makes the choice meaningful again: normal
 # ANSI variants read on a light terminal, bright ones on a dark terminal.
+# Truecolor with our own background, which is what Posting, Harlequin and
+# Toolong all do. Measured trade-off: inheriting the terminal's background
+# forces `ansi_color`, which quantises everything to sixteen colours -- and
+# sixteen colours IS the Turbo Vision look. It also removes the one device
+# that replaces borders in a modern TUI: translucent surface layers.
+# Light is PURE WHITE on purpose: it matches the macOS Terminal profile this
+# runs in, so the app is not a grey card sitting on a white desktop.
 ORQ_LIGHT = Theme(
-    name="orq-light", dark=False, foreground="ansi_default",
-    primary="ansi_blue", secondary="ansi_magenta", accent="ansi_cyan",
-    success="ansi_green", warning="ansi_yellow", error="ansi_red",
+    name="orq-light", dark=False,
+    background="#ffffff", surface="#f4f5f8", panel="#e9ebf1",
+    foreground="#1c2333", primary="#4263eb", secondary="#7950f2",
+    accent="#0ca678", success="#2f9e44", warning="#f08c00", error="#e03131",
 )
 ORQ_DARK = Theme(
-    name="orq-dark", dark=True, foreground="ansi_default",
-    primary="ansi_bright_blue", secondary="ansi_bright_magenta",
-    accent="ansi_bright_cyan", success="ansi_bright_green",
-    warning="ansi_bright_yellow", error="ansi_bright_red",
+    name="orq-dark", dark=True,
+    background="#12141c", surface="#181b25", panel="#212533",
+    foreground="#cdd3e0", primary="#748ffc", secondary="#b197fc",
+    accent="#38d9a9", success="#69db7c", warning="#ffd43b", error="#ff8787",
 )
 
 # The same slots, for the Rich markup inside table cells -- which cannot read
@@ -73,18 +82,16 @@ PAL = {}
 
 
 def set_palette(dark):
-    b = "bright_" if dark else ""
-    PAL.update({
-        "struct": f"{b}cyan",      # workspace / worktree: the skeleton
-        "work":   f"{b}yellow",    # an agent mid-turn
-        "ok":     f"{b}green",     # finished, or a schedule that passed
-        "bad":    f"{b}red",       # broken: dead session, failed job
-        "warn":   f"{b}yellow",    # dirty tree, missing window
-        "sched":  f"{b}magenta",   # schedules, kept distinct from agents
-        # The terminal's own grey. Not `dim`: SGR 2 was legible against the
-        # panel we used to paint and vanishes against a bare background.
-        "muted":  "bright_black",
-    })
+    """Hex, not ANSI slots: with our own background we know exactly what these
+    sit on, so they can be tuned instead of quantised to sixteen."""
+    if dark:
+        PAL.update({"struct": "#748ffc", "work": "#ffd43b", "ok": "#69db7c",
+                    "bad": "#ff8787", "warn": "#ffd43b", "sched": "#b197fc",
+                    "muted": "#7d8598", "faint": "#4b5262"})
+    else:
+        PAL.update({"struct": "#4263eb", "work": "#e8590c", "ok": "#2f9e44",
+                    "bad": "#e03131", "warn": "#e8590c", "sched": "#7950f2",
+                    "muted": "#7b8296", "faint": "#c2c7d2"})
 
 
 set_palette(dark=False)
@@ -201,6 +208,21 @@ def sched_cmd(execstart):
     return parts[-1] if parts else execstart
 
 
+def line(left, right, width):
+    """One column, padded to the real width, so metadata hugs the right edge.
+
+    Two DataTable columns cannot do this: the second one auto-sizes to its
+    content and the pair never fills the pane, so the annotation ended up
+    floating in the middle -- or off-screen entirely. Building the line by
+    hand is both simpler and exact."""
+    l = Text.from_markup(left or "")
+    r = Text.from_markup(right or "")
+    gap = max(1, width - l.cell_len - r.cell_len)
+    l.append(" " * gap)
+    l.append_text(r)
+    return l
+
+
 # --- rows --------------------------------------------------------------------
 
 class Row:
@@ -247,11 +269,13 @@ def collect(ws_filter=None):
         # Only say something when it is NOT the normal case: "alive" on every
         # row is noise, and the column is the one that keeps getting cut.
         state = "" if alive else f"[bold {PAL['bad']}]SESSION DEAD · [/]"
-        busy = f"[bold {PAL['work']}]{working} working[/]" if working else "[bright_black]idle[/bright_black]"
+        busy = (f"[{PAL['work']}]{working} working[/]" if working
+                else f"[{PAL['faint']}]idle[/]")
+        rows.append(Row("spacer", ["", ""]))
         rows.append(Row(
             "workspace",
-            [f"[bold {PAL['struct']}]▌ {w['workspace']}[/]", "", "", "",
-             f"{state}[bright_black]{agents} agents ·[/bright_black] {busy}"],
+            [f"[bold {PAL['struct']}]{w['workspace']}[/]",
+             f"{state}[{PAL['muted']}]{agents} agents[/]   {busy}"],
             ws=w["workspace"]))
 
         groups = [(w["lead"]["window"], None, w["lead"]["panes"],
@@ -269,8 +293,9 @@ def collect(ws_filter=None):
         for window, branch, panes, note, wt_name in groups:
             rows.append(Row(
                 "worktree",
-                [f"[{PAL['muted']}]  ├[/] [{PAL['struct']}]{window}[/]",
-                 f"[bright_black]{branch or ''}[/bright_black]", "", "", note],
+                [f"  [{PAL['muted']}]{window}[/]"
+                 + (f"   [{PAL['faint']}]{branch}[/]" if branch else ""),
+                 note],
                 worktree=wt_name, ws=w["workspace"]))
             for p in panes:
                 st = p.get("status") or ""
@@ -278,19 +303,21 @@ def collect(ws_filter=None):
                 # eye lands on the name first, and a wall of identical names
                 # was what made four workspaces unreadable.
                 color = {"working": PAL["work"], "done": PAL["ok"]}.get(st, "")
+                dot = color or PAL["faint"]
                 if not p["name"]:
-                    name = "[bright_black]○ —[/bright_black]"
-                elif color:
-                    name = f"[{color}]●[/] [{color}]{p['name']}[/]"
+                    left = f"    [{PAL['faint']}]·   free pane[/]"
                 else:
-                    name = f"[bright_black]●[/bright_black] {p['name']}"
+                    strong = "bold " if st == "working" else ""
+                    left = (f"    [{dot}]•[/]   "
+                            f"[{strong}{color or PAL['muted']}]{p['name']}[/]")
+                bits = [f"[{PAL['faint']}]{p['command']}[/]"]
+                if st:
+                    bits.append(f"[{color}]{st}[/] "
+                                f"[{PAL['faint']}]{age_since(p.get('status_at'))}[/]")
+                if p.get("parent"):
+                    bits.append(f"[{PAL['faint']}]← {p['parent']}[/]")
                 rows.append(Row(
-                    "pane",
-                    [f"[bright_black]  │  [/bright_black] {name}",
-                     f"[bright_black]{p['command']}[/bright_black]",
-                     f"[{color or 'dim'}]{st}[/]",
-                     f"[bright_black]{age_since(p.get('status_at'))}[/bright_black]",
-                     f"[bright_black]{p['parent'] + ' ←' if p.get('parent') else ''} {p['pane']}[/bright_black]"],
+                    "pane", [left, "   ".join(bits)],
                     agent=p["name"], ws=w["workspace"],
                     target=f"{session}:{window}.{p['pane']}" if alive else None,
                     status=st))
@@ -314,9 +341,9 @@ def collect_schedules():
         never = res == "-"
         # A failing schedule has to be impossible to miss: the NAME goes red,
         # not just a cell at the far right.
-        name = (f"[bold {PAL['bad']}]⏱ {s['name']}[/]" if failed
-                else f"[{PAL['ok']}]⏱ {s['name']}[/]" if res == "ok"
-                else f"[{PAL['muted']}]⏱ {s['name']}[/]")
+        dot = PAL["bad"] if failed else PAL["ok"] if res == "ok" else PAL["faint"]
+        name = (f"  [{dot}]•[/]   [{'bold ' if failed else ''}{PAL['sched']}]"
+                f"{s['name']}[/]")
         nxt = until(s.get("next"))
         nxt_c = (f"bold {PAL['work']}" if nxt in ("now", "overdue")
                  else PAL["muted"])
@@ -326,11 +353,10 @@ def collect_schedules():
         # Three columns, and the third is EMPTY unless something is wrong.
         # The glance question is "is any of these broken?" -- `never ran`
         # repeated down a column answers nothing and costs attention.
-        health = f"[bold {PAL['bad']}]✗ failed[/]" if failed else ""
-        rows.append(Row(
-            "schedule",
-            [name, f"[{nxt_c}]{nxt}[/]", health],
-            schedule=s["name"], status=res, detail=s))
+        health = f"[bold {PAL['bad']}]failed[/]" if failed else ""
+        right = f"[{nxt_c}]{nxt}[/]" + (f"   {health}" if health else "")
+        rows.append(Row("schedule", [name, right],
+                        schedule=s["name"], status=res, detail=s))
     return rows, err
 
 
@@ -361,83 +387,75 @@ class Confirm(ModalScreen[bool]):
 
 class OrqDash(App):
     CSS = """
-    Screen { layout: vertical; background: transparent; }
-    /* `!important`: Header, Footer and the Tabs bar carry component styles of
-       their own that beat a plain type selector -- they were the last thing
-       still stamping a grey band across a terminal that had its own colour. */
-    Header, HeaderIcon, HeaderTitle, Footer, FooterKey,
-    Tabs, Tab, Underline, ContentTabs, TabbedContent, TabPane,
-    ContentSwitcher, Horizontal, Vertical, Static, Label {
-        background: transparent !important;
-    }
-    Underline > .underline--bar { background: transparent; color: $primary; }
+    /* No boxes. Sections separate by SPACE and by translucent surface layers,
+       the way Posting and Harlequin do it -- a drawn rectangle around every
+       region is the Turbo Vision look, not a modern one. Borders appear only
+       to mark focus. */
+    Screen { layout: vertical; background: $background; }
+    #body { height: 1fr; padding: 0 2; }
 
-    /* The scrollbar was the grey band on the right edge: it paints its own
-       track, and a default light-grey one reads as a seam on any terminal
-       whose background is not that grey. */
-    * {
-        scrollbar-background: transparent;
-        scrollbar-background-hover: transparent;
-        scrollbar-background-active: transparent;
-        scrollbar-color: $primary 30%;
-        scrollbar-color-hover: $primary 50%;
-        scrollbar-color-active: $primary 70%;
-        scrollbar-corner-color: transparent;
-    }
-    #body { height: 1fr; padding: 0 1; }
-
-    /* Rounded panels with titles instead of bare tables butted against each
-       other -- the flat grid is what made this read as a terminal dump. */
     #left  { width: 1fr; }
     #right {
-        width: 1fr; margin-left: 1;
-        border: round $primary 40%; background: transparent;
+        width: 1fr; margin-left: 2; padding: 0 1;
+        background: $surface; border: none;
     }
     #right.hidden { display: none; }
 
     TabbedContent { height: 1fr; }
-    TabPane { padding: 0; }
+    TabPane { padding: 1 0 0 0; }
+    Tabs { height: 2; }
+    Tab { padding: 0 2; color: $text-muted; }
+    Tab.-active { color: $primary; text-style: bold; }
+    Underline > .underline--bar { color: $primary; background: $panel; }
 
     DataTable {
-        height: 1fr; background: transparent;
-        border: round $primary 40%; padding: 0 1;
+        height: 1fr; background: transparent; border: none; padding: 0;
         scrollbar-size: 1 1;
     }
-    DataTable > .datatable--header {
-        background: transparent; color: $secondary; text-style: bold;
-    }
-    DataTable > .datatable--cursor { background: $primary 25%; }
+    /* A left accent bar for the selected row instead of a full-width inverse
+       block: it marks position without shouting. */
+    DataTable > .datatable--cursor { background: $primary 12%; }
+    DataTable:focus > .datatable--cursor { background: $primary 20%; }
 
-    #preview-head { height: 1; padding: 0 1; }
+    #preview-head { height: 1; padding: 0 0 0 1; }
     #preview-title { width: 1fr; color: $accent; text-style: bold; }
-    /* A flat one-line button: Button's default border eats three rows and
-       reads like a dialog widget dropped into a status bar. */
     #preview-toggle {
-        min-width: 8; width: auto; height: 1; padding: 0 1;
-        border: none; background: $primary 25%; color: $foreground;
+        min-width: 6; width: auto; height: 1; padding: 0 1;
+        border: none; background: transparent; color: $text-muted;
     }
-    #preview-toggle:hover { background: $primary 30%; color: $text; }
-    #preview { padding: 0 1; }
+    #preview-toggle:hover { color: $primary; text-style: bold; }
+    /* `1fr` so the empty state has vertical room to centre in; the class is
+       only on while the placeholder is showing, because real preview content
+       has to start at the top left. */
+    #preview { padding: 1 1 0 1; height: 1fr; }
+    #preview.empty { content-align: center middle; text-align: center; }
 
-    /* With ansi_color on, `$text-muted` is derived from a background that no
-       longer exists, so it washes out. These read against the terminal's own
-       colours instead. */
-    #legend { padding: 0 1; color: $primary; text-style: dim; }
-    #sched-title { padding: 0 1; color: $primary; }
-    Header { color: $accent; text-style: bold; }
-    HeaderClock, HeaderClockSpace { color: $accent; }
-    HeaderTitle { color: $foreground; }
-    FooterKey { color: $foreground; }
-    FooterKey > .footer-key--key { color: $accent; text-style: bold; }
-    #status { color: $primary; }
-    #filter { display: none; dock: bottom; margin: 0 1; }
-    #filter.on { display: block; }
-    #status { dock: bottom; height: 1; padding: 0 2; }
+    #sched-title { padding: 0 0 1 0; }
+    #filter, #prompt { display: none; dock: bottom; margin: 0 2;
+                       border: none; background: $panel; }
+    #filter.on, #prompt.on { display: block; }
+    #prompt { border-left: wide $accent; }
+    #status { dock: bottom; height: 1; padding: 0 2; color: $text-muted; }
 
-    /* The modal DOES paint: it has to cover what is under it. */
+    Header { background: $background; color: $foreground; }
+    HeaderTitle { text-style: bold; color: $foreground; }
+    Footer { background: $background; }
+    FooterKey { background: $background; color: $text-muted; }
+    FooterKey > .footer-key--key { color: $primary; text-style: bold; }
+
+    * {
+        scrollbar-background: transparent;
+        scrollbar-background-hover: transparent;
+        scrollbar-background-active: transparent;
+        scrollbar-color: $primary 25%;
+        scrollbar-color-hover: $primary 45%;
+        scrollbar-color-active: $primary 65%;
+        scrollbar-corner-color: transparent;
+    }
+
     #confirm-box {
         width: 64; height: auto; padding: 1 2;
-        background: $surface; border: round $warning;
+        background: $panel; border: none; border-left: wide $warning;
     }
     Confirm { align: center middle; }
     """
@@ -463,6 +481,7 @@ class OrqDash(App):
         Binding("2", "tab_sched", "schedules"),
         Binding("l", "sched_log", "job log"),
         Binding("p", "toggle_preview", "preview"),
+        Binding("i", "prompt", "send prompt"),
     ]
 
     filter_text = reactive("")
@@ -483,7 +502,7 @@ class OrqDash(App):
         self.log_for = None
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=True)
+        yield Header(icon="")
         with Horizontal(id="body"):
             with Vertical(id="left"):
                 # Two tabs instead of two stacked tables: they answer different
@@ -491,21 +510,26 @@ class OrqDash(App):
                 # squeezed under whatever the agents tree happened to need.
                 with TabbedContent(id="tabs"):
                     with TabPane("Workspaces", id="tab-ws"):
-                        yield Static(
-                            "[b]▌[/b] workspace   ├ worktree   "
-                            "● agent   ○ free pane", id="legend")
                         yield DataTable(id="table", cursor_type="row",
-                                        zebra_stripes=False)
+                                        zebra_stripes=False,
+                                        show_header=False)
                     with TabPane("Schedules", id="tab-sched"):
                         yield Static("", id="sched-title")
                         yield DataTable(id="scheds", cursor_type="row",
-                                        zebra_stripes=False)
+                                        zebra_stripes=False,
+                                        show_header=False)
             with Vertical(id="right"):
                 with Horizontal(id="preview-head"):
                     yield Label("preview", id="preview-title")
                     yield Button("hide", id="preview-toggle")
                 yield Static("", id="preview")
         yield Input(placeholder="filter…", id="filter")
+        # A SEND bar, not a chat box. One line, one prompt, and the target is
+        # the selected row so it can never go to the wrong agent. Following
+        # the conversation still belongs in the pane, which has autocomplete,
+        # file references and the agent's own modes; what this buys is not
+        # having to switch windows to say "commit isso".
+        yield Input(placeholder="prompt…", id="prompt")
         yield Static("", id="status")
         yield Footer()
 
@@ -517,7 +541,7 @@ class OrqDash(App):
         # Screen was already transparent, but the App composites onto a
         # derived background underneath it -- which is where the grey came
         # from. This is the switch that actually hands the palette over.
-        self.ansi_color = True
+        self.ansi_color = False
         self.register_theme(ORQ_LIGHT)
         self.register_theme(ORQ_DARK)
         for name in list(self.available_themes):
@@ -530,18 +554,12 @@ class OrqDash(App):
         # Fixed widths added up to more than the pane, so `detail` was cut and
         # the table grew a horizontal scrollbar. The last column takes what is
         # left instead.
-        for col, width in (("name", 22), ("process", 9), ("state", 7),
-                           ("age", 4)):
-            t.add_column(col, width=width)
-        # No width: the last column takes whatever is left, instead of a fixed
-        # 40 that overflowed the pane and grew a horizontal scrollbar.
-        t.add_column("detail")
-
-        # Its own columns, because a schedule answers different questions.
+        # Two columns, no header. Column headers turn a dashboard into a
+        # spreadsheet; the shape of each field already says what it is, and the
+        # labels were costing a row and a rule for nothing.
+        t.add_column("", key="line")
         sc = self.query_one("#scheds", DataTable)
-        for col, width in (("schedule", 26), ("next", 11)):
-            sc.add_column(col, width=width)
-        sc.add_column("")
+        sc.add_column("", key="line")
         # Without this the arrow keys never reach the table and nothing moves.
         t.focus()
         self.query_one("#preview-toggle", Button).can_focus = False
@@ -561,24 +579,28 @@ class OrqDash(App):
     def apply_scheds(self, rows, err):
         self.sched_rows = rows
         sc = self.query_one("#scheds", DataTable)
+        w = max(20, sc.size.width - 3)
         keep = sc.cursor_row
         sc.clear()
         needle = self.filter_text.lower()
         self.sched_shown = [r for r in rows
                             if not needle or needle in r.label.lower()]
         for r in self.sched_shown:
-            sc.add_row(*r.cells)
+            sc.add_row(line(r.cells[0], r.cells[1], w))
         if sc.row_count:
             sc.move_cursor(row=min(keep or 0, sc.row_count - 1))
         failing = sum(1 for r in rows if r.status not in ("ok", "-"))
         alert = f" · [bold {PAL['bad']}]{failing} failing[/]" if failing else ""
         self.query_one("#sched-title", Static).update(
-            f"[bold {PAL['sched']}]▌ schedules[/]  "
             f"[{PAL['muted']}]{len(rows)} timer(s)[/]{alert}")
 
     def apply(self, rows, err):
         self.rows, self.err = rows, err
         t = self.query_one("#table", DataTable)
+        # -3: the scrollbar column plus a breathing space. A fixed floor
+        # was wider than the pane on a narrow terminal and clipped the
+        # right-hand annotation.
+        w = max(20, t.size.width - 3)
         keep = t.cursor_row
         t.clear()
         # NOT `self.visible`: DOMNode already owns that name, with a setter
@@ -591,7 +613,7 @@ class OrqDash(App):
             if needle and needle not in r.label.lower():
                 continue
             self.shown.append(r)
-            t.add_row(*r.cells)
+            t.add_row(line(r.cells[0], r.cells[1], w))
         if t.row_count:
             if getattr(self, "first_load", False):
                 # Land on the first agent, not on a worktree header: the
@@ -670,12 +692,15 @@ class OrqDash(App):
         body = self.query_one("#preview", Static)
         if row is None:
             title.update("preview")
+            body.add_class("empty")
             body.update(f"[{PAL['muted']}]select an agent or a schedule[/]")
         elif row.kind == "pane" and row.agent:
             title.update(f"preview · {row.agent}")
+            body.remove_class("empty")
             self.load_preview("read", row.agent)
         elif row.kind == "schedule" and self.log_for == row.schedule:
             title.update(f"log · {row.schedule}")
+            body.remove_class("empty")
             self.load_preview("schedule-log", row.schedule)
         elif row.kind == "schedule":
             # A CARD, not the journal. Filling the screen with logs on every
@@ -683,9 +708,11 @@ class OrqDash(App):
             # whether anything is wrong, and only then you dig -- `l` opens
             # the log when you actually want it.
             title.update(f"schedule · {row.schedule}")
+            body.remove_class("empty")
             body.update(self.sched_card(row))
         else:
             title.update("preview")
+            body.add_class("empty")
             body.update(f"[{PAL['muted']}]select an agent or a schedule[/]")
 
     def sched_card(self, row):
@@ -858,12 +885,49 @@ class OrqDash(App):
 
     # --- filter ---
 
+    def action_prompt(self):
+        row = self.current
+        if not row or row.kind != "pane" or not row.agent:
+            self.set_status(f"[{PAL['warn']}]select an agent first[/]")
+            return
+        self.prompt_to = row.agent
+        box = self.query_one("#prompt", Input)
+        box.placeholder = f"prompt → {row.agent}"
+        box.value = ""
+        box.add_class("on")
+        box.focus()
+
+    def send_prompt(self, text):
+        name = getattr(self, "prompt_to", None)
+        box = self.query_one("#prompt", Input)
+        box.remove_class("on")
+        box.value = ""
+        self.active_table.focus()
+        if not (name and text.strip()):
+            return
+        code, out, err = orq("send", name, text)
+        if code:
+            self.set_status(f"[bold {PAL['bad']}]{err}[/]")
+            return
+        self.set_status(f"[{PAL['ok']}]sent to {name}[/]  "
+                        f"[{PAL['faint']}]{text[:50]}[/]")
+        # Show the answer coming in without being asked: the whole point of
+        # sending from here is not having to go and look.
+        self.log_for = None
+        self.refresh_preview()
+
     def action_filter(self):
         f = self.query_one("#filter", Input)
         f.add_class("on")
         f.focus()
 
     def action_clear_filter(self):
+        box = self.query_one("#prompt", Input)
+        if box.has_class("on"):
+            box.remove_class("on")
+            box.value = ""
+            self.active_table.focus()
+            return
         f = self.query_one("#filter", Input)
         f.value = ""
         f.remove_class("on")
@@ -872,13 +936,20 @@ class OrqDash(App):
         self.apply(self.rows, self.err)
 
     def on_input_changed(self, event: Input.Changed):
+        # Guarded by id: without this, typing a prompt filtered the table
+        # underneath and the selected agent moved out from under the send.
+        if event.input.id != "filter":
+            return
         self.filter_text = event.value
         self.apply(self.rows, self.err)
 
-    def on_input_submitted(self, _):
+    def on_input_submitted(self, event: Input.Submitted):
+        if event.input.id == "prompt":
+            self.send_prompt(event.value)
+            return
         f = self.query_one("#filter", Input)
         f.remove_class("on")
-        self.query_one("#table", DataTable).focus()
+        self.active_table.focus()
 
 
 def main():
