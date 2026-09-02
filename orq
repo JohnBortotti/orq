@@ -1192,6 +1192,25 @@ def cmd_read(args):
     print(out.stdout.rstrip())
 
 
+def warn_if_session_gone(ws=None):
+    """tmux closes a window when its last pane exits, and the session when its
+    last window goes. So killing the only agent in `_lead` takes the whole
+    session with it -- correct, and surprising enough that saying nothing is
+    the actual defect. Nothing is lost: the session is disposable by design,
+    the registry is an index and git holds the worktrees."""
+    names = [ws] if ws else sorted(
+        p.stem for p in WORKSPACES.glob("*.yml")) if WORKSPACES.exists() else []
+    for name in names:
+        try:
+            cfg = workspace_config(name)
+        except OrqError:
+            continue
+        session = cfg.get("session") or name
+        if not session_exists(session):
+            print(f"  that was the last pane: session '{session}' is gone. "
+                  f"`orq up {name}` brings it back")
+
+
 def cmd_kill(args):
     """Kills by agent name, or by pane id (`%12`).
 
@@ -1221,6 +1240,7 @@ def cmd_kill(args):
                         update_state(f.stem, mutate)
         log_event(cmd="kill", pane=pane, name=killed_name, ok=True)
         print(f"{pane} killed" + (f" (was '{killed_name}')" if killed_name else ""))
+        warn_if_session_gone()
         return
 
     ws, reg = find_agent(args.name)
@@ -1231,6 +1251,7 @@ def cmd_kill(args):
     update_state(ws, mutate)
     log_event(cmd="kill", ws=ws, name=args.name, pane=reg["pane"], ok=True)
     print(f"{args.name} ({reg['pane']}) killed")
+    warn_if_session_gone(ws)
 
 
 def cmd_resurrect(args):
