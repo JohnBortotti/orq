@@ -49,16 +49,45 @@ PREVIEW_LINES = 60
 # where it is running" look. Only the accents are ours -- they are what makes
 # the two read as the same product -- and the CSS keeps every container
 # transparent so the terminal's own background shows through.
+# Every colour is an ANSI slot, not a hex: the point is to look native in
+# WHATEVER terminal this runs in, and a hand-picked hex only looks right
+# against the background it was picked for -- which we no longer own.
+# The light/dark toggle is what makes the choice meaningful again: normal
+# ANSI variants read on a light terminal, bright ones on a dark terminal.
 ORQ_LIGHT = Theme(
-    name="orq-light", dark=False,
-    primary="#3b5bdb", secondary="#7048e8", accent="#0c8599",
-    success="#2f9e44", warning="#e8590c", error="#e03131",
+    name="orq-light", dark=False, foreground="ansi_default",
+    primary="ansi_blue", secondary="ansi_magenta", accent="ansi_cyan",
+    success="ansi_green", warning="ansi_yellow", error="ansi_red",
 )
 ORQ_DARK = Theme(
-    name="orq-dark", dark=True,
-    primary="#7aa2f7", secondary="#bb9af7", accent="#7dcfff",
-    success="#9ece6a", warning="#e0af68", error="#f7768e",
+    name="orq-dark", dark=True, foreground="ansi_default",
+    primary="ansi_bright_blue", secondary="ansi_bright_magenta",
+    accent="ansi_bright_cyan", success="ansi_bright_green",
+    warning="ansi_bright_yellow", error="ansi_bright_red",
 )
+
+# The same slots, for the Rich markup inside table cells -- which cannot read
+# Textual's CSS variables. Rebuilt whenever the theme changes so the cells and
+# the chrome never drift apart.
+PAL = {}
+
+
+def set_palette(dark):
+    b = "bright_" if dark else ""
+    PAL.update({
+        "struct": f"{b}cyan",      # workspace / worktree: the skeleton
+        "work":   f"{b}yellow",    # an agent mid-turn
+        "ok":     f"{b}green",     # finished, or a schedule that passed
+        "bad":    f"{b}red",       # broken: dead session, failed job
+        "warn":   f"{b}yellow",    # dirty tree, missing window
+        "sched":  f"{b}magenta",   # schedules, kept distinct from agents
+        # The terminal's own grey. Not `dim`: SGR 2 was legible against the
+        # panel we used to paint and vanishes against a bare background.
+        "muted":  "bright_black",
+    })
+
+
+set_palette(dark=False)
 # Light first: it is what he works in.
 THEMES = ("orq-light", "orq-dark")
 
@@ -217,12 +246,12 @@ def collect(ws_filter=None):
         working = sum(1 for p in panes_all if p.get("status") == "working")
         # Only say something when it is NOT the normal case: "alive" on every
         # row is noise, and the column is the one that keeps getting cut.
-        state = "" if alive else "[red]SESSION DEAD · [/red]"
-        busy = f"[bold yellow]{working} working[/]" if working else "[dim]idle[/dim]"
+        state = "" if alive else f"[bold {PAL['bad']}]SESSION DEAD · [/]"
+        busy = f"[bold {PAL['work']}]{working} working[/]" if working else "[bright_black]idle[/bright_black]"
         rows.append(Row(
             "workspace",
-            [f"[bold cyan]▌ {w['workspace']}[/]", "", "", "",
-             f"{state}[dim]{agents} agents ·[/dim] {busy}"],
+            [f"[bold {PAL['struct']}]▌ {w['workspace']}[/]", "", "", "",
+             f"{state}[bright_black]{agents} agents ·[/bright_black] {busy}"],
             ws=w["workspace"]))
 
         groups = [(w["lead"]["window"], None, w["lead"]["panes"],
@@ -230,38 +259,38 @@ def collect(ws_filter=None):
         for wt in w["worktrees"]:
             notes = []
             if wt["exists"] is False:
-                notes.append("[red]path gone[/red]")
+                notes.append(f"[{PAL['bad']}]path gone[/]")
             elif not wt["window_alive"]:
-                notes.append("[yellow]no window[/yellow]")
+                notes.append(f"[{PAL['warn']}]no window[/]")
             if wt["dirty"]:
-                notes.append("[yellow]dirty[/yellow]")
+                notes.append(f"[{PAL['warn']}]dirty[/]")
             groups.append((wt["worktree"], wt["branch"], wt["panes"],
                            " · ".join(notes), wt["worktree"]))
         for window, branch, panes, note, wt_name in groups:
             rows.append(Row(
                 "worktree",
-                [f"[dim]  ├[/dim] [cyan]{window}[/]",
-                 f"[dim]{branch or ''}[/dim]", "", "", note],
+                [f"[{PAL['muted']}]  ├[/] [{PAL['struct']}]{window}[/]",
+                 f"[bright_black]{branch or ''}[/bright_black]", "", "", note],
                 worktree=wt_name, ws=w["workspace"]))
             for p in panes:
                 st = p.get("status") or ""
                 # The NAME carries the state, not just the state column: the
                 # eye lands on the name first, and a wall of identical names
                 # was what made four workspaces unreadable.
-                color = {"working": "yellow", "done": "green"}.get(st, "")
+                color = {"working": PAL["work"], "done": PAL["ok"]}.get(st, "")
                 if not p["name"]:
-                    name = "[dim]○ —[/dim]"
+                    name = "[bright_black]○ —[/bright_black]"
                 elif color:
                     name = f"[{color}]●[/] [{color}]{p['name']}[/]"
                 else:
-                    name = f"[dim]●[/dim] {p['name']}"
+                    name = f"[bright_black]●[/bright_black] {p['name']}"
                 rows.append(Row(
                     "pane",
-                    [f"[dim]  │  [/dim] {name}",
-                     f"[dim]{p['command']}[/dim]",
+                    [f"[bright_black]  │  [/bright_black] {name}",
+                     f"[bright_black]{p['command']}[/bright_black]",
                      f"[{color or 'dim'}]{st}[/]",
-                     f"[dim]{age_since(p.get('status_at'))}[/dim]",
-                     f"[dim]{p['parent'] + ' ←' if p.get('parent') else ''} {p['pane']}[/dim]"],
+                     f"[bright_black]{age_since(p.get('status_at'))}[/bright_black]",
+                     f"[bright_black]{p['parent'] + ' ←' if p.get('parent') else ''} {p['pane']}[/bright_black]"],
                     agent=p["name"], ws=w["workspace"],
                     target=f"{session}:{window}.{p['pane']}" if alive else None,
                     status=st))
@@ -285,17 +314,19 @@ def collect_schedules():
         never = res == "-"
         # A failing schedule has to be impossible to miss: the NAME goes red,
         # not just a cell at the far right.
-        name = (f"[bold red]⏱ {s['name']}[/]" if failed
-                else f"[green]⏱ {s['name']}[/]" if res == "ok"
-                else f"[dim]⏱ {s['name']}[/dim]")
+        name = (f"[bold {PAL['bad']}]⏱ {s['name']}[/]" if failed
+                else f"[{PAL['ok']}]⏱ {s['name']}[/]" if res == "ok"
+                else f"[{PAL['muted']}]⏱ {s['name']}[/]")
         nxt = until(s.get("next"))
-        nxt_c = "bold yellow" if nxt in ("now", "overdue") else "dim"
-        result = ("[bold red]failed[/]" if failed
-                  else "[green]ok[/]" if res == "ok" else "[dim]never ran[/dim]")
+        nxt_c = (f"bold {PAL['work']}" if nxt in ("now", "overdue")
+                 else PAL["muted"])
+        result = (f"[bold {PAL['bad']}]failed[/]" if failed
+                  else f"[{PAL['ok']}]ok[/]" if res == "ok"
+                  else f"[{PAL['muted']}]never ran[/]")
         # Three columns, and the third is EMPTY unless something is wrong.
         # The glance question is "is any of these broken?" -- `never ran`
         # repeated down a column answers nothing and costs attention.
-        health = "[bold red]✗ failed[/]" if failed else ""
+        health = f"[bold {PAL['bad']}]✗ failed[/]" if failed else ""
         rows.append(Row(
             "schedule",
             [name, f"[{nxt_c}]{nxt}[/]", health],
@@ -320,7 +351,7 @@ class Confirm(ModalScreen[bool]):
     def compose(self) -> ComposeResult:
         with Vertical(id="confirm-box"):
             yield Label(self.question, id="confirm-text")
-            yield Label("[dim]y to confirm · esc to cancel[/dim]")
+            yield Label("[bright_black]y to confirm · esc to cancel[/bright_black]")
 
     def action_yes(self):
         self.dismiss(True)
@@ -373,7 +404,7 @@ class OrqDash(App):
         scrollbar-size: 1 1;
     }
     DataTable > .datatable--header {
-        background: transparent; color: $text-muted; text-style: none;
+        background: transparent; color: $secondary; text-style: bold;
     }
     DataTable > .datatable--cursor { background: $primary 25%; }
 
@@ -383,16 +414,25 @@ class OrqDash(App):
        reads like a dialog widget dropped into a status bar. */
     #preview-toggle {
         min-width: 8; width: auto; height: 1; padding: 0 1;
-        border: none; background: $primary 20%; color: $text-muted;
+        border: none; background: $primary 25%; color: $foreground;
     }
     #preview-toggle:hover { background: $primary 30%; color: $text; }
     #preview { padding: 0 1; }
 
-    #legend { padding: 0 1; color: $text-muted; }
-    #sched-title { padding: 0 1; color: $text-muted; }
+    /* With ansi_color on, `$text-muted` is derived from a background that no
+       longer exists, so it washes out. These read against the terminal's own
+       colours instead. */
+    #legend { padding: 0 1; color: $primary; text-style: dim; }
+    #sched-title { padding: 0 1; color: $primary; }
+    Header { color: $accent; text-style: bold; }
+    HeaderClock, HeaderClockSpace { color: $accent; }
+    HeaderTitle { color: $foreground; }
+    FooterKey { color: $foreground; }
+    FooterKey > .footer-key--key { color: $accent; text-style: bold; }
+    #status { color: $primary; }
     #filter { display: none; dock: bottom; margin: 0 1; }
     #filter.on { display: block; }
-    #status { dock: bottom; height: 1; padding: 0 2; color: $text-muted; }
+    #status { dock: bottom; height: 1; padding: 0 2; }
 
     /* The modal DOES paint: it has to cover what is under it. */
     #confirm-box {
@@ -531,9 +571,10 @@ class OrqDash(App):
         if sc.row_count:
             sc.move_cursor(row=min(keep or 0, sc.row_count - 1))
         failing = sum(1 for r in rows if r.status not in ("ok", "-"))
-        alert = f" · [bold red]{failing} failing[/]" if failing else ""
+        alert = f" · [bold {PAL['bad']}]{failing} failing[/]" if failing else ""
         self.query_one("#sched-title", Static).update(
-            f"[bold cyan]▌ schedules[/]  [dim]{len(rows)} timer(s)[/dim]{alert}")
+            f"[bold {PAL['sched']}]▌ schedules[/]  "
+            f"[{PAL['muted']}]{len(rows)} timer(s)[/]{alert}")
 
     def apply(self, rows, err):
         self.rows, self.err = rows, err
@@ -561,7 +602,7 @@ class OrqDash(App):
                 self.first_load = False
             else:
                 t.move_cursor(row=min(keep, t.row_count - 1))
-        self.set_status(err and f"[red]{err}[/red]" or self.counts())
+        self.set_status(err and f"[bold {PAL['bad']}]{err}[/]" or self.counts())
         self.refresh_preview()
 
     def counts(self):
@@ -629,7 +670,7 @@ class OrqDash(App):
         body = self.query_one("#preview", Static)
         if row is None:
             title.update("preview")
-            body.update("[dim]select an agent or a schedule[/dim]")
+            body.update(f"[{PAL['muted']}]select an agent or a schedule[/]")
         elif row.kind == "pane" and row.agent:
             title.update(f"preview · {row.agent}")
             self.load_preview("read", row.agent)
@@ -645,33 +686,33 @@ class OrqDash(App):
             body.update(self.sched_card(row))
         else:
             title.update("preview")
-            body.update("[dim]select an agent or a schedule[/dim]")
+            body.update(f"[{PAL['muted']}]select an agent or a schedule[/]")
 
     def sched_card(self, row):
         d = row.detail or {}
         res = d.get("result") or "-"
-        health = ("[bold red]last run FAILED[/]" if res not in ("ok", "-")
-                  else "[green]last run ok[/]" if res == "ok"
-                  else "[dim]has never run[/dim]")
+        health = (f"[bold {PAL['bad']}]last run FAILED[/]" if res not in ("ok", "-")
+                  else f"[{PAL['ok']}]last run ok[/]" if res == "ok"
+                  else f"[{PAL['muted']}]has never run[/]")
         # The command is the thing you actually want to read when judging a
         # schedule -- it is what will run, unattended, with nobody watching --
         # so it gets a label and the full text instead of a dim tail.
         cmd = sched_cmd(d.get("exec")) or "?"
         lines = [
-            d.get("desc") or "[dim]no description[/dim]",
+            d.get("desc") or "[bright_black]no description[/bright_black]",
             "",
             health,
-            f"[dim]next[/dim]     {until(d.get('next'))}  "
-            f"[dim]({when_short(d.get('next'))})[/dim]",
-            f"[dim]last[/dim]     {ago(d.get('last'))}",
-            f"[dim]when[/dim]     {d.get('calendar') or '?'}",
-            f"[dim]by[/dim]       {d.get('creator') or '?'}",
+            f"[bright_black]next[/bright_black]     {until(d.get('next'))}  "
+            f"[bright_black]({when_short(d.get('next'))})[/bright_black]",
+            f"[bright_black]last[/bright_black]     {ago(d.get('last'))}",
+            f"[bright_black]when[/bright_black]     {d.get('calendar') or '?'}",
+            f"[bright_black]by[/bright_black]       {d.get('creator') or '?'}",
             "",
-            "[dim]command[/dim]",
-            f"[$accent]{escape(cmd)}[/]",
+            "[bright_black]command[/bright_black]",
+            f"[{PAL['struct']}]{escape(cmd)}[/]",
         ]
         if res not in ("ok", "-"):
-            lines += ["", "[dim]press[/dim] [b]l[/b] [dim]for the log[/dim]"]
+            lines += ["", "[bright_black]press[/bright_black] [b]l[/b] [bright_black]for the log[/bright_black]"]
         return "\n".join(lines)
 
     @work(thread=True, exclusive=True, group="preview")
@@ -681,7 +722,7 @@ class OrqDash(App):
         else:
             code, out, err = orq("schedule", "log", name,
                                  "--lines", str(PREVIEW_LINES))
-        text = out.rstrip() if code == 0 else f"[red]{err}[/red]"
+        text = out.rstrip() if code == 0 else f"[bold {PAL['bad']}]{err}[/]"
         self.call_from_thread(
             lambda: self.query_one("#preview", Static).update(text))
 
@@ -698,14 +739,14 @@ class OrqDash(App):
         """
         row = self.current
         if not row or not row.target:
-            self.set_status("[yellow]nothing to switch to on this row[/yellow]")
+            self.set_status(f"[{PAL['warn']}]nothing to switch to on this row[/]")
             return
         p = subprocess.run(["tmux", "-L", "orq", "switch-client", "-t", row.target],
                            capture_output=True, text=True)
         if p.returncode:
-            self.set_status(f"[red]{p.stderr.strip()}[/red]")
+            self.set_status(f"[bold {PAL['bad']}]{p.stderr.strip()}[/]")
         else:
-            self.set_status(f"[green]→ {row.target}[/green]")
+            self.set_status(f"[{PAL['ok']}]→ {row.target}[/]")
 
     def action_sched_log(self):
         row = self.current
@@ -749,6 +790,8 @@ class OrqDash(App):
 
     def action_theme(self):
         self.theme = THEMES[1] if self.theme == THEMES[0] else THEMES[0]
+        set_palette(dark=self.theme == "orq-dark")
+        self.reload()
         self.set_status(f"theme: {self.theme}")
 
     def action_refresh(self):
@@ -756,7 +799,8 @@ class OrqDash(App):
 
     def run_and_report(self, *args, ok=None):
         code, out, err = orq(*args)
-        self.set_status(f"[red]{err}[/red]" if code else f"[green]{ok or out.strip()}[/green]")
+        self.set_status(f"[bold {PAL['bad']}]{err}[/]" if code
+                        else f"[{PAL['ok']}]{ok or out.strip()}[/]")
         self.reload()
 
     def action_kill(self):
@@ -764,8 +808,8 @@ class OrqDash(App):
         if not row or row.kind != "pane":
             return
         if not row.agent:
-            self.set_status("[yellow]that pane is not registered — "
-                            "orq only kills named agents[/yellow]")
+            self.set_status(f"[{PAL['warn']}]that pane is not registered — "
+                            f"orq only kills named agents[/]")
             return
         def go(yes):
             if yes:
@@ -780,7 +824,7 @@ class OrqDash(App):
         if not row or row.kind != "worktree" or not row.worktree:
             return
         if row.worktree.startswith("_"):
-            self.set_status("[yellow]that is not a worktree[/yellow]")
+            self.set_status(f"[{PAL['warn']}]that is not a worktree[/]")
             return
         def go(yes):
             if yes:
