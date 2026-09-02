@@ -410,7 +410,10 @@ class OrqDash(App):
 
     DataTable {
         height: 1fr; background: transparent; border: none; padding: 0;
-        scrollbar-size: 1 1;
+        /* No visible scrollbar: it was a permanent vertical stripe down the
+           list. Scrolling still happens -- the cursor drags the view with it
+           -- it just stops advertising itself. */
+        scrollbar-size: 0 0;
     }
     /* A left accent bar for the selected row instead of a full-width inverse
        block: it marks position without shouting. */
