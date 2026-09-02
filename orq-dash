@@ -33,11 +33,12 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.message import Message
 from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.theme import Theme
 from textual.widgets import (Button, DataTable, Footer, Header, Input,
-                             Label, Static, TabbedContent, TabPane)
+                             Label, Static, TabbedContent, TabPane, TextArea)
 
 # `switch-client` needs an attached client, and outside tmux there is none.
 # `capture-pane` and `send-keys` talk to the SERVER and do not, which is why
@@ -469,6 +470,44 @@ def collect_schedules():
     return rows, err
 
 
+class PromptBox(TextArea):
+    """The send bar. A TextArea, not an Input, because Input is one line by
+    construction and a prompt is not always one line.
+
+    Enter sends, because the common case is a single line and having to reach
+    for a modifier to do the usual thing is backwards. The newline is bound
+    twice on purpose: `ctrl+j` is a literal line feed and arrives in every
+    terminal, and `alt+enter` is what macOS Terminal delivers for Option+Return
+    ONCE "Use Option as Meta key" is on. Without that setting the terminal
+    drops the Option and the app receives a plain Enter -- indistinguishable,
+    so no binding can rescue it.
+    """
+
+    BINDINGS = [
+        Binding("enter", "send", "send", priority=True, show=False),
+        Binding("alt+enter", "newline", "newline", priority=True, show=False),
+        Binding("ctrl+j", "newline", "newline", priority=True, show=False),
+        Binding("escape", "cancel", "cancel", priority=True, show=False),
+    ]
+
+    class Sent(Message):
+        def __init__(self, text):
+            super().__init__()
+            self.text = text
+
+    class Cancelled(Message):
+        pass
+
+    def action_send(self):
+        self.post_message(self.Sent(self.text))
+
+    def action_newline(self):
+        self.insert("\n")
+
+    def action_cancel(self):
+        self.post_message(self.Cancelled())
+
+
 # --- confirmation ------------------------------------------------------------
 
 class Confirm(ModalScreen[bool]):
@@ -554,9 +593,14 @@ class OrqDash(App):
        docks bottom too and wins, so the input was being drawn underneath it
        -- you were typing behind the footer. Hidden they take no space, so the
        vertical flow costs nothing. */
-    #filter, #prompt { display: none; margin: 0 2; height: 1;
-                       border: none; padding: 0 1;
-                       background: $panel; color: $foreground; }
+    #filter { display: none; margin: 0 2; height: 1;
+              border: none; padding: 0 1;
+              background: $panel; color: $foreground; }
+    /* auto height: the send bar grows as the prompt gains lines. */
+    #prompt { display: none; margin: 0 2; height: auto; max-height: 10;
+              border: none; padding: 0 1;
+              background: $panel; color: $foreground; }
+    #prompt > .text-area--cursor-line { background: $panel; }
     #filter.on, #prompt.on { display: block; }
     /* NOT docked: it collided with the Footer, which also docks bottom and
        won -- every status message this app produced was painted underneath
@@ -662,7 +706,7 @@ class OrqDash(App):
         # the conversation still belongs in the pane, which has autocomplete,
         # file references and the agent's own modes; what this buys is not
         # having to switch windows to say "commit isso".
-        yield Input(placeholder="prompt…", id="prompt")
+        yield PromptBox(id="prompt", show_line_numbers=False, soft_wrap=True)
         yield Static("", id="status")
         yield Footer()
 
@@ -1223,17 +1267,29 @@ class OrqDash(App):
             self.set_status(f"[{PAL['warn']}]select an agent first[/]")
             return
         self.prompt_to = row.agent
-        box = self.query_one("#prompt", Input)
-        box.placeholder = f"prompt → {row.agent}"
-        box.value = ""
+        box = self.query_one("#prompt", PromptBox)
+        box.text = ""
         box.add_class("on")
         box.focus()
+        self.set_status(
+            f"[{PAL['muted']}]prompt →[/] [bold]{row.agent}[/]   "
+            f"[{PAL['faint']}]enter sends · ctrl+j (or option+return) for a "
+            f"new line · esc cancels[/]", hold=30)
+
+    def on_prompt_box_sent(self, event: PromptBox.Sent):
+        self.send_prompt(event.text)
+
+    def on_prompt_box_cancelled(self, _):
+        box = self.query_one("#prompt", PromptBox)
+        box.remove_class("on")
+        box.text = ""
+        self.active_table.focus()
 
     def send_prompt(self, text):
         name = getattr(self, "prompt_to", None)
-        box = self.query_one("#prompt", Input)
+        box = self.query_one("#prompt", PromptBox)
         box.remove_class("on")
-        box.value = ""
+        box.text = ""
         self.active_table.focus()
         if not (name and text.strip()):
             return
@@ -1254,10 +1310,10 @@ class OrqDash(App):
         f.focus()
 
     def action_clear_filter(self):
-        box = self.query_one("#prompt", Input)
+        box = self.query_one("#prompt", PromptBox)
         if box.has_class("on"):
             box.remove_class("on")
-            box.value = ""
+            box.text = ""
             self.active_table.focus()
             return
         f = self.query_one("#filter", Input)
@@ -1276,9 +1332,6 @@ class OrqDash(App):
         self.apply(self.rows, self.err)
 
     def on_input_submitted(self, event: Input.Submitted):
-        if event.input.id == "prompt":
-            self.send_prompt(event.value)
-            return
         f = self.query_one("#filter", Input)
         f.remove_class("on")
         self.active_table.focus()
