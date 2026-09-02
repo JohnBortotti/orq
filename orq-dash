@@ -244,6 +244,29 @@ def pane_screen(target, keep=None):
     return out
 
 
+def window_of(target):
+    """`session:window.%pane` -> `session:window`."""
+    return target.rsplit(".", 1)[0] if "." in target else target
+
+
+def window_layout(target):
+    p = subprocess.run(["tmux", "-L", "orq", "display-message", "-p", "-t",
+                        window_of(target), "#{window_layout}"],
+                       capture_output=True, text=True)
+    return p.stdout.strip() if p.returncode == 0 else ""
+
+
+def resize_pane(target, cols):
+    subprocess.run(["tmux", "-L", "orq", "resize-pane", "-t", target,
+                    "-x", str(cols)], capture_output=True)
+
+
+def restore_layout(target, layout):
+    if layout:
+        subprocess.run(["tmux", "-L", "orq", "select-layout", "-t",
+                        window_of(target), layout], capture_output=True)
+
+
 def send_key(target, key):
     subprocess.run(["tmux", "-L", "orq", "send-keys", "-t", target, key],
                    capture_output=True)
@@ -805,6 +828,12 @@ class OrqDash(App):
             body.add_class("empty")
             body.update(f"[{PAL['muted']}]select an agent or a schedule[/]")
 
+    def pane_of(self, agent):
+        for r in self.shown:
+            if r.kind == "pane" and r.agent == agent:
+                return r.target or r.pane
+        return None
+
     def sched_card(self, row):
         d = row.detail or {}
         res = d.get("result") or "-"
@@ -835,20 +864,36 @@ class OrqDash(App):
     @work(thread=True, exclusive=True, group="attach")
     def load_attached(self, target, keep=None):
         screen = pane_screen(target, keep)
+        # CROP, never wrap. A captured screen is a fixed grid: the rules
+        # Claude Code draws above and below its input are as wide as ITS pane,
+        # and letting them reflow turns every one of them into two ragged
+        # lines. Cutting shows less and stays readable.
+        text = Text.from_ansi(screen, no_wrap=True, overflow="crop")
         self.call_from_thread(
-            lambda: self.query_one("#preview", Static).update(
-                Text.from_ansi(screen)))
+            lambda: self.query_one("#preview", Static).update(text))
 
     @work(thread=True, exclusive=True, group="preview")
     def load_preview(self, kind, name):
         if kind == "read":
-            code, out, err = orq("read", name, "--lines", str(PREVIEW_LINES))
+            # -e keeps the colours; the plain `orq read` throws them away and
+            # the preview looked like a transcript instead of a screen.
+            reg = self.pane_of(name)
+            if reg:
+                code, out, err = 0, pane_screen(reg, PREVIEW_LINES), ""
+            else:
+                code, out, err = orq("read", name, "--lines", str(PREVIEW_LINES))
         else:
             code, out, err = orq("schedule", "log", name,
                                  "--lines", str(PREVIEW_LINES))
-        text = out.rstrip() if code == 0 else f"[bold {PAL['bad']}]{err}[/]"
+        if code == 0:
+            # Same reason as attach mode: the pane preview is a screen, not
+            # prose, so it is cropped rather than reflowed.
+            body = Text.from_ansi(out.rstrip(), no_wrap=True, overflow="crop") \
+                if kind == "read" else out.rstrip()
+        else:
+            body = f"[bold {PAL['bad']}]{err}[/]"
         self.call_from_thread(
-            lambda: self.query_one("#preview", Static).update(text))
+            lambda: self.query_one("#preview", Static).update(body))
 
     # --- actions: the target comes from the selected row, never typed ---
 
@@ -908,9 +953,21 @@ class OrqDash(App):
         self.query_one("#preview-title", Label).update(
             f"attached · {self.attached_name}   "
             f"[{PAL['faint']}]{ATTACH_EXIT} to leave[/]")
+        # The pane is drawn for ITS width. Attached to a pane that shares a
+        # split window, that is half the screen, so the content filled half a
+        # full-width panel. Widening the real pane makes the agent redraw for
+        # the width you are actually looking at; the layout is saved first and
+        # put back on the way out, so the tmux window is not left rearranged.
+        self.attach_layout = window_layout(row.target)
+        self.call_after_refresh(self._fit_pane)
         self.attach_timer = self.set_interval(ATTACH_POLL_S, self.tick_attached)
         self.tick_attached()
         self.refresh_bindings()
+
+    def _fit_pane(self):
+        if self.attached:
+            resize_pane(self.attached, max(40, self.query_one("#preview").size.width))
+            self.tick_attached()
 
     def tick_attached(self):
         if self.attached:
@@ -918,6 +975,9 @@ class OrqDash(App):
                                max(6, self.query_one("#preview").size.height))
 
     def action_detach(self):
+        if self.attached:
+            restore_layout(self.attached, getattr(self, "attach_layout", ""))
+        self.attach_layout = ""
         self.attached = None
         timer = getattr(self, "attach_timer", None)
         if timer is not None:
