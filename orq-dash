@@ -523,6 +523,8 @@ class OrqDash(App):
         Binding("p", "toggle_preview", "preview"),
         Binding("i", "prompt", "send prompt"),
         Binding("a", "attach", "attach"),
+        Binding("g", "top", "top", show=False),
+        Binding("G", "bottom", "bottom", show=False),
         Binding(ATTACH_EXIT, "detach", "leave pane", show=False),
     ]
 
@@ -908,6 +910,24 @@ class OrqDash(App):
                            capture_output=True)
         else:
             send_key(self.attached, event.key)
+
+    def action_top(self):
+        self._jump(first=True)
+
+    def action_bottom(self):
+        self._jump(first=False)
+
+    def _jump(self, first):
+        """Land on a SELECTABLE row, not on a workspace header or a blank
+        spacer -- jumping to the literal first line would leave the preview
+        empty and the actions dead."""
+        table = self.active_table
+        rows = (self.sched_shown if table.id == "scheds" else self.shown)
+        idx = [i for i, r in enumerate(rows) if r.kind in ("pane", "schedule")]
+        if not idx:
+            return
+        table.move_cursor(row=idx[0] if first else idx[-1])
+        table.focus()
 
     def action_toggle_preview(self):
         right = self.query_one("#right")
