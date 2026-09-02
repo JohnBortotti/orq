@@ -34,6 +34,12 @@ from textual.widgets import (DataTable, Footer, Header, Input, Label, Static)
 REFRESH_S = 2.0
 PREVIEW_LINES = 60
 
+# Textual ships 21 themes. A dashboard you glance at all day wants one
+# decision -- dark or light -- not a gallery: every extra entry is noise in
+# the command palette and one more thing that can render the status colours
+# differently from what was designed against.
+THEMES = ("textual-dark", "textual-light")
+
 
 # --- talking to orq ----------------------------------------------------------
 
@@ -230,6 +236,7 @@ class OrqDash(App):
         Binding("slash", "filter", "filter"),
         Binding("escape", "clear_filter", "clear filter", show=False),
         Binding("r", "refresh", "refresh"),
+        Binding("t", "theme", "dark/light"),
     ]
 
     filter_text = reactive("")
@@ -253,6 +260,13 @@ class OrqDash(App):
         yield Footer()
 
     def on_mount(self):
+        # Drop every theme but the two. `available_themes` is the source the
+        # command palette reads, so unregistering is what actually removes
+        # them from the picker -- setting `theme` alone would not.
+        for name in list(self.available_themes):
+            if name not in THEMES:
+                self.unregister_theme(name)
+        self.theme = THEMES[0]
         self.title = "orq"
         self.sub_title = self.ws or "all workspaces"
         t = self.query_one("#table", DataTable)
@@ -324,6 +338,13 @@ class OrqDash(App):
     def on_data_table_row_highlighted(self, _):
         self.refresh_preview()
 
+    def on_data_table_row_selected(self, _):
+        """DataTable owns Enter -- it has its own binding for selecting a row,
+        so the App-level `enter` binding never fires and the jump silently did
+        nothing. Reacting to the table's own event is what actually works; the
+        binding stays only so the key shows up in the footer."""
+        self.action_switch()
+
     def refresh_preview(self):
         row = self.current
         title = self.query_one("#preview-title", Label)
@@ -345,11 +366,28 @@ class OrqDash(App):
     # --- actions: the target comes from the selected row, never typed ---
 
     def action_switch(self):
+        """Hands the view to the pane and STAYS RUNNING.
+
+        `switch-client` only changes which window the client looks at, so the
+        dashboard keeps living in its own window with its state intact --
+        cursor, filter and all. Exiting here used to throw that away on every
+        jump, which made the dashboard something you left rather than
+        something you worked from.
+        """
         row = self.current
-        if row and row.target:
-            subprocess.run(["tmux", "-L", "orq", "switch-client", "-t", row.target],
-                           capture_output=True)
-            self.exit()
+        if not row or not row.target:
+            self.set_status("[yellow]nothing to switch to on this row[/yellow]")
+            return
+        p = subprocess.run(["tmux", "-L", "orq", "switch-client", "-t", row.target],
+                           capture_output=True, text=True)
+        if p.returncode:
+            self.set_status(f"[red]{p.stderr.strip()}[/red]")
+        else:
+            self.set_status(f"[green]→ {row.target}[/green]")
+
+    def action_theme(self):
+        self.theme = THEMES[1] if self.theme == THEMES[0] else THEMES[0]
+        self.set_status(f"theme: {self.theme}")
 
     def action_refresh(self):
         self.reload()
