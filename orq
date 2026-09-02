@@ -37,6 +37,11 @@ WORKSPACES = HOME / "workspaces"
 STATE = HOME / "state"
 LOG = HOME / "log.jsonl"
 HOOKS = HOME / "hooks"
+# Where systemd keeps the `Persistent=true` stamp of each timer. `schedule rm`
+# has to delete it: leaving it behind makes a NEW schedule that reuses an old
+# name report the old run as its `last`, and can make systemd decide a run was
+# missed and fire the job the moment it is created.
+TIMER_STAMPS = Path.home() / ".local/share/systemd/timers"
 
 # Schedules: the UNIT is the registry. There is no mirror under ~/.orq/ to
 # drift -- the unit describes itself and `schedule ls` reads systemd directly.
@@ -1300,7 +1305,7 @@ def cmd_resurrect(args):
         log_event(cmd="resurrect", ws=ws, wt=window, path=meta["path"],
                   source=meta["source"], ok=True)
         mark = "" if meta["source"] == "registry" else "  [only git knew]"
-        print(f"  recriada  {ws}:{window}  [{meta.get('branch') or '?'}]{mark}")
+        print(f"  recreated  {ws}:{window}  [{meta.get(chr(39)+chr(98)+chr(114)+chr(97)+chr(110)+chr(99)+chr(104)+chr(39)) or chr(63)}]{mark}")
 
 
 def fmt_pane(p):
@@ -1337,10 +1342,19 @@ def cmd_schedule_add(args):
     # `claude -p "long prompt"` would become several arguments. shlex.join
     # rebuilds a shell line equivalent to the original argv.
     cmd = shlex.join(args.command)
-    ws = ws_arg(args)
     creator = caller_agent() or "human"
     agora = datetime.now(timezone.utc).astimezone().isoformat()
-    wd = str(lead_root(workspace_config(ws))) if ws else str(expand("~"))
+    # A schedule used to take `--ws`, which set this directory AND filed the
+    # unit under a workspace. Dropped on 2026-09-02: it did not do what its
+    # name promised (deleting the workspace left the schedule running with a
+    # frozen WorkingDirectory, and nothing ever revalidated it), and it
+    # contradicted the thesis that a schedule is only "when" plus "what".
+    # `--cwd` does the one thing that was actually useful and promises nothing
+    # else.
+    wd = expand(args.cwd) if args.cwd else expand("~")
+    if not wd.is_dir():
+        raise OrqError(f"--cwd '{wd}' does not exist or is not a directory")
+    wd = str(wd)
 
     UNITS.mkdir(parents=True, exist_ok=True)
     unit = f"{SCHED_PREFIX}{args.name}"
@@ -1351,7 +1365,7 @@ def cmd_schedule_add(args):
     (UNITS / f"{unit}.service").write_text(
         f"[Unit]\n"
         f"Description={title}\n"
-        f"# orq: name={args.name}  ws={ws or '-'}  creator={creator}  em={agora}\n"
+        f"# orq: name={args.name}  creator={creator}  at={agora}\n"
         f"# orq: calendar={calendar}\n"
         f"\n[Service]\n"
         f"Type=oneshot\n"
@@ -1379,7 +1393,7 @@ def cmd_schedule_add(args):
 
     # Write-through: log AFTER systemd confirmed, so the log never asserts
     # something that does not exist.
-    log_event(cmd="schedule add", name=args.name, ws=ws, creator=creator,
+    log_event(cmd="schedule add", name=args.name, cwd=wd, creator=creator,
               calendar=calendar, command_str=cmd, next=next_at, ok=True)
     print(f"{args.name}  ->  {unit}.timer")
     print(f"  when: {calendar}")
@@ -1389,9 +1403,13 @@ def cmd_schedule_add(args):
     print(f"  command: {cmd}")
 
 
-def schedule_rows(ws=None):
-    """Linhas de schedule, lidas do systemd. Compartilhado pelo `schedule ls`
-    e pelo `ls` -- o plano quer schedule e workspace na MESMA dashboard."""
+def schedule_rows():
+    """Rows of schedules, read from systemd. Shared by `schedule ls` and by
+    `ls` -- the plan wants schedules and workspaces on the SAME dashboard.
+
+    There is no workspace filter: a schedule belongs to no workspace. Filtering
+    used to hide global jobs from every per-workspace view, which is exactly
+    where a broken backup would go unnoticed."""
     rows = []
     for name in sched_units():
         unit = f"{SCHED_PREFIX}{name}"
@@ -1405,14 +1423,10 @@ def schedule_rows(ws=None):
             "state": d.get("ActiveState"),
             "next": d.get("NextElapseUSecRealtime") or None,
             "last": d.get("LastTriggerUSec") or None,
-            # `-` is the empty marker in the unit (text); in JSON it is null
-            "ws": (meta.get("ws") or None) if meta.get("ws") != "-" else None,
             "creator": meta.get("creator"),
             "calendar": meta.get("calendar"), "exec": meta.get("exec"),
             "desc": meta.get("desc") or "",
         })
-    if ws:
-        rows = [l for l in rows if l["ws"] == ws]
     return rows
 
 
@@ -1423,7 +1437,7 @@ def fmt_schedule(s_, indent="  "):
            f"{indent}next: {s_['next'] or '-'}"]
     if s_["last"]:
         out.append(f"{indent}last: {s_['last']}")
-    out.append(f"{indent}creator: {s_['creator'] or '?'}   ws: {s_['ws'] or '-'}")
+    out.append(f"{indent}creator: {s_['creator'] or '?'}")
     out.append(f"{indent}exec: {s_['exec'] or '?'}")
     return "\n".join(out)
 
@@ -1445,8 +1459,8 @@ def cmd_schedule_rm(args):
         raise OrqError(f"schedule '{args.name}' does not exist")
     unit = f"{SCHED_PREFIX}{args.name}"
     systemctl("disable", "--now", f"{unit}.timer", check=False)
-    for sufixo in (".timer", ".service"):
-        target = UNITS / f"{unit}{sufixo}"
+    for target in (UNITS / f"{unit}.timer", UNITS / f"{unit}.service",
+                   TIMER_STAMPS / f"stamp-{unit}.timer"):
         if target.exists():
             target.unlink()
     systemctl("daemon-reload")
@@ -1559,7 +1573,7 @@ def cmd_ls(args):
     # Schedules go into the SAME output as the workspaces: it is the single
     # dashboard the plan asks for, and the "no state lives only inside the CLI"
     # contract applies to them too. Filtered by workspace when one was asked for.
-    scheds = schedule_rows(ws=_ws)
+    scheds = schedule_rows()
 
     if args.json:
         # Shape change: the top level used to be a LIST of workspaces and is
@@ -1688,7 +1702,7 @@ def dash_rows(_ws, width=100):
     """
     rows = []
     tree = ls_tree(_ws)
-    scheds = schedule_rows(ws=_ws)
+    scheds = schedule_rows()
 
     for w in tree:
         panes_todos = [p for wt in w["worktrees"] for p in wt["panes"]] + w["lead"]["panes"]
@@ -1742,7 +1756,7 @@ def dash_rows(_ws, width=100):
         rows.append(("colhead",
                        f"    {'name':<16}{'next run':<14}{'last run':<16}"
                        f"{'what it does':<{col_desc}}",
-                       "workspace ", None, "dim"))
+                       "created by ", None, "dim"))
     for sc in scheds:
         res = sched_result(sc["name"])
         color = {"ok": "ok", "-": "dim"}.get(res, "bad")
@@ -1753,8 +1767,7 @@ def dash_rows(_ws, width=100):
             what = what[:col_desc - 1] + "…"
         left = (f"    {sc['name']:<16}{when_short(sc['next']):<14}"
                f"{res:<16}{what:<{col_desc}}")
-        mark = ("global" if not sc["ws"] else sc["ws"])
-        rows.append(("sched", left, mark + " ", None, color))
+        rows.append(("sched", left, (sc["creator"] or "") + " ", None, color))
     return rows
 
 
@@ -1985,8 +1998,10 @@ def build_parser():
     sp = sub.add_parser("schedule", help="add | ls | rm | run")
     sc = sp.add_subparsers(dest="schedule_cmd", required=True)
     add = sc.add_parser("add"); add.add_argument("name")
-    add.add_argument("--cron"); add.add_argument("--calendar"); add.add_argument("--ws")
-    add.add_argument("--desc", metavar="TEXTO",
+    add.add_argument("--cron"); add.add_argument("--calendar")
+    add.add_argument("--cwd", metavar="PATH",
+                     help="directory the job runs in (default: ~)")
+    add.add_argument("--desc", metavar="TEXT",
                      help="short human description, shown in the dash")
     # The command comes after `--` and is split off BEFORE argparse (see main).
     # With nargs=REMAINDER here, argparse swallowed orq's own flags: an
