@@ -21,6 +21,7 @@ would undo it.
 
 import json
 import subprocess
+import time
 
 from rich.markup import escape
 from rich.text import Text
@@ -262,7 +263,8 @@ class Row:
     the user typing a name."""
 
     def __init__(self, kind, cells, *, agent=None, worktree=None, schedule=None,
-                 ws=None, target=None, status=None, detail=None):
+                 ws=None, target=None, status=None, detail=None,
+                 pane=None, real=True):
         self.kind = kind          # "pane" | "worktree" | "schedule"
         self.cells = cells
         self.agent = agent
@@ -272,6 +274,8 @@ class Row:
         self.target = target      # session:window.pane, for switch-client
         self.status = status
         self.detail = detail      # raw JSON, for the on-demand card
+        self.pane = pane          # %id, so a pane with no agent is still killable
+        self.real = real          # a worktree orq owns, vs _lead or a stray window
 
     @property
     def label(self):
@@ -320,15 +324,20 @@ def collect(ws_filter=None):
                 notes.append(f"[{PAL['warn']}]no window[/]")
             if wt["dirty"]:
                 notes.append(f"[{PAL['warn']}]dirty[/]")
+            # `unregistered` is how ls marks a window orq did not create --
+            # the dashboard's own window, say. It is listed because it exists,
+            # but it is not a worktree and `wt rm` has nothing to do with it.
             groups.append((wt["worktree"], wt["branch"], wt["panes"],
-                           " · ".join(notes), wt["worktree"]))
+                           " · ".join(notes),
+                           None if wt.get("unregistered") else wt["worktree"]))
         for window, branch, panes, note, wt_name in groups:
             rows.append(Row(
                 "worktree",
                 [f"  [{PAL['muted']}]{window}[/]"
                  + (f"   [{PAL['faint']}]{branch}[/]" if branch else ""),
                  note],
-                worktree=wt_name, ws=w["workspace"]))
+                worktree=wt_name or window, ws=w["workspace"],
+                real=wt_name is not None))
             for p in panes:
                 st = p.get("status") or ""
                 # The NAME carries the state, not just the state column: the
@@ -350,7 +359,7 @@ def collect(ws_filter=None):
                     bits.append(f"[{PAL['faint']}]← {p['parent']}[/]")
                 rows.append(Row(
                     "pane", [left, "   ".join(bits)],
-                    agent=p["name"], ws=w["workspace"],
+                    agent=p["name"], pane=p["pane"], ws=w["workspace"],
                     target=f"{session}:{window}.{p['pane']}" if alive else None,
                     status=st))
 
@@ -475,7 +484,10 @@ class OrqDash(App):
                        border: none; background: $panel; }
     #filter.on, #prompt.on { display: block; }
     #prompt { border-left: wide $accent; }
-    #status { dock: bottom; height: 1; padding: 0 2; color: $text-muted; }
+    /* NOT docked: it collided with the Footer, which also docks bottom and
+       won -- every status message this app produced was painted underneath
+       it. In the vertical flow it gets a row of its own. */
+    #status { height: 1; padding: 0 2; color: $text-muted; }
 
     Header { background: $background; color: $foreground; }
     HeaderTitle { text-style: bold; color: $foreground; }
@@ -671,7 +683,10 @@ class OrqDash(App):
                 self.first_load = False
             else:
                 t.move_cursor(row=min(keep, t.row_count - 1))
-        self.set_status(err and f"[bold {PAL['bad']}]{err}[/]" or self.counts())
+        if err:
+            self.set_status(f"[bold {PAL['bad']}]{err}[/]")
+        else:
+            self.set_counts()
         self.refresh_preview()
 
     def counts(self):
@@ -682,8 +697,17 @@ class OrqDash(App):
         return (f"{len(panes)} pane(s) · {working} working · "
                 f"{scheds} schedule(s){shown}")
 
-    def set_status(self, text):
+    def set_status(self, text, hold=6.0):
+        """Messages stay put for a few seconds. The 2s refresh was overwriting
+        them with the counts before they could be read, which made every
+        refusal look like the key doing nothing."""
+        self.status_until = time.monotonic() + hold
         self.query_one("#status", Static).update(text)
+
+    def set_counts(self):
+        if time.monotonic() < getattr(self, "status_until", 0):
+            return
+        self.query_one("#status", Static).update(self.counts())
 
     @property
     def current(self):
@@ -1007,25 +1031,31 @@ class OrqDash(App):
     def action_kill(self):
         row = self.current
         if not row or row.kind != "pane":
+            self.set_status(f"[{PAL['warn']}]select a pane to kill[/]")
             return
-        if not row.agent:
-            self.set_status(f"[{PAL['warn']}]that pane is not registered — "
-                            f"orq only kills named agents[/]")
-            return
+        # A pane with no agent is killed by its id. It used to be listed and
+        # unkillable, which read as the key being broken.
+        target = row.agent or row.pane
+        what = row.agent or f"pane {row.pane}"
         def go(yes):
             if yes:
-                self.run_and_report("kill", row.agent, ok=f"{row.agent} killed")
+                self.run_and_report("kill", target, ok=f"{what} killed")
         self.push_screen(
-            Confirm(f"kill '{row.agent}'?\n"
-                    f"the pane dies and the registry entry goes with it. "
+            Confirm(f"kill {what}?\n"
+                    f"the pane dies and any registry entry goes with it. "
                     f"the worktree and its branch are untouched."), go)
 
     def action_wt_rm(self):
         row = self.current
-        if not row or row.kind != "worktree" or not row.worktree:
+        if not row or row.kind != "worktree":
+            self.set_status(f"[{PAL['warn']}]select a worktree to remove[/]")
             return
-        if row.worktree.startswith("_"):
-            self.set_status(f"[{PAL['warn']}]that is not a worktree[/]")
+        # Silence was the bug: on the _lead row, and on a stray window that orq
+        # does not own, this returned without a word and looked broken.
+        if not row.real:
+            what = ("the workspace's lead window" if row.worktree.startswith("_")
+                    else f"'{row.worktree}' is a window orq does not own")
+            self.set_status(f"[{PAL['warn']}]{what} — nothing to remove[/]")
             return
         def go(yes):
             if yes:

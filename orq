@@ -1193,6 +1193,36 @@ def cmd_read(args):
 
 
 def cmd_kill(args):
+    """Kills by agent name, or by pane id (`%12`).
+
+    The pane id matters because a pane does not need an agent to exist: a
+    worktree window is born with a plain shell, and `--cmd` panes are never
+    named either. Accepting only registered names meant the dashboard could
+    LIST panes it had no way to act on -- the asymmetry showed up the moment
+    somebody pressed `k` on one and nothing happened.
+    """
+    if args.name.startswith("%"):
+        pane = args.name
+        if pane not in all_pane_ids():
+            raise OrqError(f"pane {pane} does not exist")
+        tmux("kill-pane", "-t", pane, check=False)
+        # An unnamed pane may still be registered under a name -- prune it, or
+        # the registry keeps pointing at something that is gone.
+        killed_name = None
+        if WORKSPACES.exists():
+            for f in sorted(WORKSPACES.glob("*.yml")):
+                agents = read_state(f.stem).get("agents") or {}
+                for name, reg in agents.items():
+                    if reg.get("pane") == pane:
+                        killed_name = name
+
+                        def mutate(st, n=name):
+                            st.get("agents", {}).pop(n, None)
+                        update_state(f.stem, mutate)
+        log_event(cmd="kill", pane=pane, name=killed_name, ok=True)
+        print(f"{pane} killed" + (f" (was '{killed_name}')" if killed_name else ""))
+        return
+
     ws, reg = find_agent(args.name)
     tmux("kill-pane", "-t", reg["pane"], check=False)
 
@@ -1766,8 +1796,10 @@ def build_parser():
     sp.add_argument("--split", action="store_true"); sp.add_argument("--ws")
     sp.set_defaults(func=cmd_spawn)
 
-    sp = sub.add_parser("kill", help="kill the pane and drop it from the registry")
-    sp.add_argument("name"); sp.set_defaults(func=cmd_kill)
+    sp = sub.add_parser("kill",
+                        help="kill a pane, by agent name or by pane id (%%12)")
+    sp.add_argument("name", metavar="name|%pane")
+    sp.set_defaults(func=cmd_kill)
 
     sp = sub.add_parser("send", help="paste a prompt into the pane")
     sp.add_argument("name"); sp.add_argument("text")
