@@ -331,8 +331,28 @@ class Confirm(ModalScreen[bool]):
 class OrqDash(App):
     CSS = """
     Screen { layout: vertical; background: transparent; }
-    Header, Footer, Tabs, TabbedContent, TabPane, ContentSwitcher,
-    Horizontal, Vertical { background: transparent; }
+    /* `!important`: Header, Footer and the Tabs bar carry component styles of
+       their own that beat a plain type selector -- they were the last thing
+       still stamping a grey band across a terminal that had its own colour. */
+    Header, HeaderIcon, HeaderTitle, Footer, FooterKey,
+    Tabs, Tab, Underline, ContentTabs, TabbedContent, TabPane,
+    ContentSwitcher, Horizontal, Vertical, Static, Label {
+        background: transparent !important;
+    }
+    Underline > .underline--bar { background: transparent; color: $primary; }
+
+    /* The scrollbar was the grey band on the right edge: it paints its own
+       track, and a default light-grey one reads as a seam on any terminal
+       whose background is not that grey. */
+    * {
+        scrollbar-background: transparent;
+        scrollbar-background-hover: transparent;
+        scrollbar-background-active: transparent;
+        scrollbar-color: $primary 30%;
+        scrollbar-color-hover: $primary 50%;
+        scrollbar-color-active: $primary 70%;
+        scrollbar-corner-color: transparent;
+    }
     #body { height: 1fr; padding: 0 1; }
 
     /* Rounded panels with titles instead of bare tables butted against each
@@ -453,6 +473,11 @@ class OrqDash(App):
         # Drop every theme but the two. `available_themes` is the source the
         # command palette reads, so unregistering is what actually removes
         # them from the picker -- setting `theme` alone would not.
+        # Render with the TERMINAL's own colours, including its background.
+        # Screen was already transparent, but the App composites onto a
+        # derived background underneath it -- which is where the grey came
+        # from. This is the switch that actually hands the palette over.
+        self.ansi_color = True
         self.register_theme(ORQ_LIGHT)
         self.register_theme(ORQ_DARK)
         for name in list(self.available_themes):
