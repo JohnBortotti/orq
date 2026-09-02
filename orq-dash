@@ -607,9 +607,10 @@ class OrqDash(App):
        docks bottom too and wins, so the input was being drawn underneath it
        -- you were typing behind the footer. Hidden they take no space, so the
        vertical flow costs nothing. */
-    #filter { display: none; margin: 0 2; height: 1;
-              border: none; padding: 0 1;
-              background: $panel; color: $foreground; }
+    #filter, #spawn { display: none; margin: 0 2; height: 1;
+                      border: none; padding: 0 1;
+                      background: $panel; color: $foreground; }
+    #spawn.on { display: block; }
     /* auto height: the send bar grows as the prompt gains lines. */
     #prompt { display: none; margin: 0 2; height: auto; max-height: 10;
               border: none; padding: 0 1;
@@ -667,6 +668,7 @@ class OrqDash(App):
         Binding("p", "toggle_preview", "preview"),
         Binding("i", "prompt", "send prompt"),
         Binding("a", "attach", "attach"),
+        Binding("s", "spawn", "new agent"),
         Binding("g", "top", "top", show=False),
         Binding("G", "bottom", "bottom", show=False),
         Binding(ATTACH_EXIT, "detach", "leave pane", show=False),
@@ -721,6 +723,7 @@ class OrqDash(App):
         # file references and the agent's own modes; what this buys is not
         # having to switch windows to say "commit isso".
         yield PromptBox(id="prompt", show_line_numbers=False, soft_wrap=True)
+        yield Input(placeholder="agent name…", id="spawn")
         yield Static("", id="status")
         yield Footer()
 
@@ -1163,7 +1166,8 @@ class OrqDash(App):
     # Actions that only make sense on one tab. `check_action` both hides them
     # from the footer AND disables the key, so this is not decoration: `x` on
     # the workspaces tab no longer half-works on a schedule you cannot see.
-    WS_ONLY = {"switch", "kill", "wt_rm", "prompt", "resurrect", "attach"}
+    WS_ONLY = {"switch", "kill", "wt_rm", "prompt", "resurrect", "attach",
+               "spawn"}
     SCHED_ONLY = {"sched_rm", "sched_run", "sched_log"}
 
     def check_action(self, action, parameters):
@@ -1275,6 +1279,67 @@ class OrqDash(App):
 
     # --- filter ---
 
+    def action_spawn(self):
+        """Create an agent where the cursor is. The target comes from the row,
+        so the workspace and worktree are never typed -- the same reason every
+        other action here reads the selection instead of asking."""
+        row = self.current
+        if not row or row.kind not in ("workspace", "worktree", "pane"):
+            self.set_status(f"[{PAL['warn']}]select a workspace, worktree or "
+                            f"pane first[/]")
+            return
+        if row.kind == "workspace":
+            wt, where, name = None, "_lead", "lead"
+        else:
+            wt = row.worktree if row.kind == "worktree" else self.worktree_of(row)
+            if not wt or not row.real and row.kind == "worktree":
+                self.set_status(f"[{PAL['warn']}]that window is not a worktree "
+                                f"orq owns[/]")
+                return
+            where, name = wt, wt.split("/")[-1]
+        self.spawn_ws, self.spawn_wt = row.ws, wt
+        box = self.query_one("#spawn", Input)
+        box.value = self.free_name(name)
+        box.add_class("on")
+        box.focus()
+        self.set_status(
+            f"[{PAL['muted']}]new agent in[/] [bold]{where}[/]   "
+            f"[{PAL['faint']}]enter creates · esc cancels[/]", hold=30)
+
+    def free_name(self, base):
+        """`fc660`, then `fc660-2` -- a name already in use is refused by orq,
+        and finding that out after typing is friction the dashboard can spare."""
+        taken = {r.agent for r in self.rows if r.agent}
+        if base not in taken:
+            return base
+        n = 2
+        while f"{base}-{n}" in taken:
+            n += 1
+        return f"{base}-{n}"
+
+    def worktree_of(self, row):
+        """The worktree a pane row sits under, by walking back up the list."""
+        seen = None
+        for r in self.shown:
+            if r.kind == "worktree":
+                seen = r.worktree if r.real else None
+            if r is row:
+                return seen
+        return None
+
+    def do_spawn(self, name):
+        box = self.query_one("#spawn", Input)
+        box.remove_class("on")
+        box.value = ""
+        self.active_table.focus()
+        name = name.strip()
+        if not name:
+            return
+        args = ["spawn", name, "--ws", self.spawn_ws]
+        if self.spawn_wt:
+            args += ["--wt", self.spawn_wt, "--split"]
+        self.run_and_report(*args, ok=f"{name} spawned")
+
     def action_prompt(self):
         row = self.current
         if not row or row.kind != "pane" or not row.agent:
@@ -1324,6 +1389,12 @@ class OrqDash(App):
         f.focus()
 
     def action_clear_filter(self):
+        sp = self.query_one("#spawn", Input)
+        if sp.has_class("on"):
+            sp.remove_class("on")
+            sp.value = ""
+            self.active_table.focus()
+            return
         box = self.query_one("#prompt", PromptBox)
         if box.has_class("on"):
             box.remove_class("on")
@@ -1346,6 +1417,9 @@ class OrqDash(App):
         self.apply(self.rows, self.err)
 
     def on_input_submitted(self, event: Input.Submitted):
+        if event.input.id == "spawn":
+            self.do_spawn(event.value)
+            return
         f = self.query_one("#filter", Input)
         f.remove_class("on")
         self.active_table.focus()
