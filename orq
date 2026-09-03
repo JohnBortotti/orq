@@ -499,7 +499,7 @@ def caller_agent():
     return None
 
 
-def provider_cmd(nome_provider, session_id):
+def provider_cmd(nome_provider, session_id, mcp=None):
     provs = providers_config()
     if nome_provider not in provs:
         known = ", ".join(sorted(provs)) or "(nenhum)"
@@ -516,7 +516,35 @@ def provider_cmd(nome_provider, session_id):
     # screen.
     if "{hooks}" in cmd:
         cmd = cmd.replace("{hooks}", shlex.quote(str(hooks_file(nome_provider))))
+    # Same contract once more, and the reason it has to exist: providers scope
+    # their MCP servers BY PROJECT PATH, and a worktree is a path the user has
+    # never configured -- so an agent born in `~/wt/api/fc660` sees none of the
+    # servers the lead sees in `~/workspace/forest`. The workspace's `mcp:`
+    # files are what carry them across.
+    if "{mcp}" in cmd:
+        flag = mcp_flag(mcp)
+        cmd = (cmd.replace(" {mcp}", f" {flag}" if flag else "")
+                  .replace("{mcp}", flag))
     return cmd
+
+
+def mcp_flag(mcp):
+    """`--mcp-config` for the workspace's MCP files -- nothing when it has none.
+
+    The files are the provider's own format and are read by the provider, never
+    by orq: this stays a table, like providers.yml. They live outside the repos
+    on purpose, because an MCP entry commonly carries a token.
+    """
+    if not mcp:
+        return ""
+    paths = [mcp] if isinstance(mcp, str) else list(mcp)
+    out = []
+    for p in paths:
+        path = expand(p)
+        if not path.exists():
+            raise OrqError(f"mcp file does not exist: {path}")
+        out.append(shlex.quote(str(path)))
+    return "--mcp-config " + " ".join(out)
 
 
 def hooks_file(provider):
@@ -1006,7 +1034,7 @@ def cmd_spawn(args):
         binary = None
     else:
         provider = args.provider or cfg.get("provider") or "claude"
-        base = provider_cmd(provider, session_id)
+        base = provider_cmd(provider, session_id, cfg.get("mcp"))
         launch = f"{base}; exec $SHELL"
         binary = base.split()[0]
         pcfg = providers_config().get(provider) or {}

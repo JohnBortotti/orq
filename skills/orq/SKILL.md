@@ -175,6 +175,15 @@ Claude Code queues what arrives mid-generation, so this is safe — but it means
 input, and if it finds a blocking dialog instead it leaves the pane alive and
 tells you. The prompt was not sent; resolve it on screen and use `orq send`.
 
+**MCP servers come from the workspace, not from where the agent sits.**
+Providers scope MCP servers by project path, and a worktree is a path nobody
+configured — so an agent in `~/wt/api/fc660` would otherwise see none of the
+servers the `_lead` sees. The workspace's `mcp:` key in
+`~/.orq/workspaces/<ws>.yml` points at the provider's own MCP JSON and every
+agent orq spawns there gets it. If a spawned agent reports a tool missing that
+you have, the workspace has no `mcp:` — that is config, so say so; do not try
+to work around it.
+
 **`wt rm` refuses for reasons worth reading**, not to be worked around:
 
 | refusal | what it means |
