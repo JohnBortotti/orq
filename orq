@@ -91,6 +91,12 @@ LEAD_WINDOW = "_lead"
 # Idle shells: a pane running one of these is "free" for spawn to take over.
 SHELLS = {"bash", "zsh", "fish", "sh", "dash", "ksh"}
 
+# `done` delivers to a pane. A coordinator running as a background job has no
+# pane, so `--parent-exec` gives it a command to be reached by instead. The
+# timeout is short and mandatory: a hook that hangs must not hang the worker
+# that is only trying to close its turn.
+PARENT_EXEC_TIMEOUT = 10
+
 # Pitfall 5: the prompt can only be sent after the agent is up, otherwise it
 # lands in the shell. See wait_for_ready -- readiness is data, not code.
 BOOT_TIMEOUT_S = 30
@@ -875,6 +881,9 @@ def cmd_wt_new(args):
         cmd_spawn(argparse.Namespace(
             name=name, ws=ws, ws_pos=None, wt=window, provider=args.spawn,
             cmd_str=None, prompt=args.prompt, parent=None, split=False,
+            parent_exec=getattr(args, "parent_exec", None),
+            parent_exec_timeout=getattr(args, "parent_exec_timeout",
+                                        PARENT_EXEC_TIMEOUT),
         ))
 
 
@@ -1074,6 +1083,12 @@ def cmd_spawn(args):
         pane = p.stdout.strip()
 
     parent = args.parent or caller_agent()
+    # NOT inherited, and never derived from the caller. `parent` falls back to
+    # caller_agent() because a pane is a place a message can be delivered; a
+    # hook is a side effect somebody asked for. The adversarial reviewer is
+    # born `--split` inside the worker's own worktree -- inheriting there would
+    # fire the coordinator's webhook from a pane the coordinator never spawned.
+    parent_exec = args.parent_exec
 
     def mutate(st):
         st.setdefault("agents", {})[args.name] = {
@@ -1081,6 +1096,8 @@ def cmd_spawn(args):
             "window": window, "provider": provider,
             "cmd": args.cmd_str, "session_id": session_id if provider else None,
             "parent": parent, "path": path,
+            "parent_exec": parent_exec,
+            "parent_exec_timeout": args.parent_exec_timeout if parent_exec else None,
             "created_at": datetime.now(timezone.utc).astimezone().isoformat(),
         }
     update_state(ws, mutate)
@@ -1088,13 +1105,15 @@ def cmd_spawn(args):
               window=window, name=args.name, pane=pane,
               provider=provider, cmd_str=args.cmd_str,
               session_id=session_id if provider else None, parent=parent,
-              took_existing=take, ok=True)
+              parent_exec=parent_exec, took_existing=take, ok=True)
 
     print(f"{args.name}  {pane}  in {window}"
           f"{f'  ({provider})' if provider else f'  ({args.cmd_str})'}"
           f"{'  [took the existing pane]' if take else ''}")
     if parent:
         print(f"  parent: {parent}")
+    if parent_exec:
+        print(f"  parent-exec: {parent_exec}")
 
     if args.prompt:
         ready, reason = wait_for_ready(pane, binary, ready_when, blocked_when)
@@ -1141,6 +1160,46 @@ def cmd_keys(args):
               keys=args.keys, ok=True)
 
 
+def run_parent_exec(cmd, timeout, payload):
+    """Deliver a `done` to something that is not a pane.
+
+    Returns None when the command succeeded, or a reason string when it did
+    not. It NEVER raises and it never propagates a failure: `done` is a worker
+    closing its turn, and a broken hook must not break the worker.
+
+    The event goes in on STDIN, never in argv. `msg` is written by an agent and
+    has carried newlines, quotes and em-dashes -- interpolating that into a
+    shell line is a quoting bug at best and a command injection at worst. The
+    ORQ_* variables are the convenience for hooks that do not want to parse
+    JSON (`--parent-exec 'touch /tmp/orq-done-$ORQ_NAME'`).
+    """
+    env = dict(os.environ)
+    env.update({
+        "ORQ_WS": payload["ws"] or "",
+        "ORQ_NAME": payload["name"] or "",
+        "ORQ_PANE": payload["pane"] or "",
+        "ORQ_WT": payload.get("wt") or "",
+        "ORQ_MSG": payload.get("msg") or "",
+        "ORQ_TS": payload["ts"],
+    })
+    try:
+        # `sh -c` so that a pipe and a redirect work in the hook. The child is
+        # a plain process: outside tmux, it does not inherit the pane as a TTY.
+        p = subprocess.run(["sh", "-c", cmd],
+                           input=json.dumps(payload, ensure_ascii=False),
+                           text=True, capture_output=True,
+                           timeout=timeout, env=env)
+    except subprocess.TimeoutExpired:
+        return f"parent_exec timeout {timeout:g}s"
+    except Exception as e:                    # no sh, fork failure, bad cwd
+        return f"parent_exec failed: {e}"
+    if p.returncode != 0:
+        # 127 is the shell saying the command does not exist -- the most
+        # common way this fails, and worth reading straight off the log.
+        return f"parent_exec exit {p.returncode}"
+    return None
+
+
 def cmd_done(args):
     """Closes the turn: writes the status to the registry and notifies the
     parent.
@@ -1167,26 +1226,65 @@ def cmd_done(args):
     dest = args.to or reg.get("parent")
     msg = f"[{name}] done" + (f": {args.msg}" if args.msg else "")
 
+    # Two independent paths, and BOTH are attempted: the pane sees the message
+    # go by while the hook wakes a coordinator that has no pane at all. `via`
+    # says which ones delivered; `reason` accumulates the ones that did not.
+    # `--to` still overrides the registered parent rather than adding to it --
+    # that is the current meaning of the flag and it does not change here.
+    hook = reg.get("parent_exec")
+    via, reasons = [], []
+
+    if hook:
+        # Attempted before the pane, so that a `--to` naming nobody -- which
+        # still raises, as it always has -- cannot swallow the hook.
+        failure = run_parent_exec(
+            hook, reg.get("parent_exec_timeout") or PARENT_EXEC_TIMEOUT,
+            {"cmd": "done", "ws": ws, "name": name, "pane": reg["pane"],
+             "wt": reg.get("wt"), "to": dest, "msg": args.msg,
+             "ts": datetime.now(timezone.utc).astimezone().isoformat()})
+        (reasons.append(failure) if failure else via.append("parent_exec"))
+
+    def event(**extra):
+        f = {"cmd": "done", "ws": ws, "name": name, "pane": reg["pane"],
+             "msg": args.msg, "delivered": bool(via)}
+        if via:
+            f["via"] = ",".join(via)
+        if reasons:
+            f["reason"] = "; ".join(reasons)
+        return {**f, **extra}
+
     # The status is written before delivery is attempted, and is not undone if
     # delivery fails: whoever finished finished, recipient or no recipient.
     if not dest:
-        log_event(cmd="done", ws=ws, name=name, pane=reg["pane"], to=None,
-                  msg=args.msg, delivered=False, reason="sem parent_", ok=True)
+        # With no hook configured this is the untouched original path, down to
+        # `reason: "sem parent_"` -- the string anyone greps the log for.
+        if not hook:
+            log_event(cmd="done", ws=ws, name=name, pane=reg["pane"], to=None,
+                      msg=args.msg, delivered=False, reason="sem parent_", ok=True)
+            print(f"{name}: status done recorded")
+            print("  nobody notified -- no parent in the registry and no --to")
+            return
+        log_event(**event(to=None, ok=True))
         print(f"{name}: status done recorded")
-        print("  nobody notified -- no parent in the registry and no --to")
+        print(f"  no pane to notify; parent-exec "
+              f"{'delivered' if via else 'FAILED: ' + '; '.join(reasons)}")
         return
 
     try:
         _, reg_pai = find_agent(dest)
     except OrqError as e:
-        log_event(cmd="done", ws=ws, name=name, pane=reg["pane"], to=dest,
-                  msg=args.msg, delivered=False, reason=str(e), ok=False)
-        raise OrqError(f"status done recorded, but '{dest}' was not notified: {e}")
+        reasons.append(str(e))
+        log_event(**event(to=dest, ok=False))
+        raise OrqError(
+            f"status done recorded, but '{dest}' was not notified: {e}"
+            + ("  (the parent-exec hook did fire)" if via else ""))
 
     paste_into(reg_pai["pane"], msg)
-    log_event(cmd="done", ws=ws, name=name, pane=reg["pane"], to=dest,
-              to_pane=reg_pai["pane"], msg=args.msg, delivered=True, ok=True)
+    via.append("pane")
+    log_event(**event(to=dest, to_pane=reg_pai["pane"], ok=True))
     print(f"{name}: status done recorded; notified '{dest}' ({reg_pai['pane']})")
+    if hook and "parent_exec" not in via:
+        print(f"  parent-exec FAILED: {'; '.join(reasons)}")
 
 
 def cmd_status_hook(args):
@@ -1634,6 +1732,8 @@ def ls_tree(_ws=None):
                 "name": reg["name"] if reg else None,
                 "provider": reg.get("provider") if reg else None,
                 "parent": reg.get("parent") if reg else None,
+                # The command `done` runs for a parent that is not a pane.
+                "parent_exec": reg.get("parent_exec") if reg else None,
                 # `done` does not kill the pane, so "pane alive" no longer
                 # tells working from finished. The status is what does.
                 "status": reg.get("status") if reg else None,
@@ -1826,6 +1926,13 @@ def build_parser():
     new.add_argument("--as", dest="as_name", metavar="NAME",
                      help="name for the --spawn agent (default: the slug)")
     new.add_argument("--prompt", help="initial prompt, with --spawn")
+    # `wt new --spawn` is the common sequence; without the flag here a
+    # coordinator would have to split it into two commands just to get a hook.
+    new.add_argument("--parent-exec", dest="parent_exec",
+                     help="with --spawn: the command `orq done` runs, "
+                          "for a parent that is not a pane")
+    new.add_argument("--parent-exec-timeout", dest="parent_exec_timeout",
+                     type=float, default=PARENT_EXEC_TIMEOUT)
     new.add_argument("--no-files", action="store_true")
     new.add_argument("--no-hooks", action="store_true")
     new.set_defaults(func=cmd_wt_new)
@@ -1849,6 +1956,14 @@ def build_parser():
     sp.add_argument("--wt")
     sp.add_argument("--provider"); sp.add_argument("--cmd", dest="cmd_str")
     sp.add_argument("--prompt"); sp.add_argument("--parent")
+    sp.add_argument("--parent-exec", dest="parent_exec",
+                    help="shell command `orq done` runs for this agent, with "
+                         "the event on stdin -- how a coordinator with no pane "
+                         "gets told. Not inherited by panes this one spawns")
+    sp.add_argument("--parent-exec-timeout", dest="parent_exec_timeout",
+                    type=float, default=PARENT_EXEC_TIMEOUT,
+                    help=f"seconds before the hook is given up on "
+                         f"(default {PARENT_EXEC_TIMEOUT})")
     sp.add_argument("--split", action="store_true"); sp.add_argument("--ws")
     sp.set_defaults(func=cmd_spawn)
 
