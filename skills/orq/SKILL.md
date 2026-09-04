@@ -132,6 +132,41 @@ orq done --to lead "blocked on X" # to somebody else
 work is over" — the work ends at a merge, and cleanup belongs to `wt rm`. Your
 pane stays up with the conversation on it, so a follow-up costs nothing.
 
+### When the parent is not a pane
+
+⚠️ **`done` delivers by pasting into a pane.** A coordinator running as a
+background job has no pane, so every `done` under it logs
+`delivered:false, reason:"sem parent_"` and the message — including a long
+review verdict — reaches nobody. `--to` does not help: every name it accepts
+is also a pane.
+
+Give such an agent a command instead, at spawn time:
+
+```bash
+orq spawn fc-704 --wt api/fc-704 \
+  --parent-exec 'curl -s -XPOST localhost:9099/orq-done -d @-' \
+  --prompt '...  when finished run: orq done "fc-704 is ready"'
+```
+
+When that agent calls `done`, orq runs the command with the event as JSON on
+**stdin** (`cmd`, `ws`, `name`, `pane`, `wt`, `to`, `msg`, `ts`), and the same
+fields in the environment as `ORQ_WS`, `ORQ_NAME`, `ORQ_PANE`, `ORQ_WT`,
+`ORQ_MSG`, `ORQ_TS` — so `--parent-exec 'touch /tmp/done-$ORQ_NAME'` works
+without parsing anything. The coordinator listens on whatever it passed: a
+port, a FIFO, a file it watches.
+
+- **The pane and the hook are both attempted.** `via` in the log says which
+  delivered (`pane`, `parent_exec`, or both).
+- **A broken hook never fails `done`.** A non-zero exit, a missing command or
+  a timeout becomes `delivered:false` with a `reason`, and the worker moves on.
+  The timeout is 10s, changeable with `--parent-exec-timeout`.
+- **It is not inherited.** An agent you spawn from inside a pane that has a
+  hook does not get that hook — pass it again if you want it. This is what
+  keeps an adversarial reviewer, born `--split` in the worker's own worktree,
+  from firing a webhook nobody pointed at it.
+- `msg` is **never** interpolated into the command line, so a verdict with
+  quotes, newlines or a stray `;` is safe.
+
 ---
 
 ## 4. Reading a screen
