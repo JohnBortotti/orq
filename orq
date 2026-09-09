@@ -109,9 +109,9 @@ class OrqError(Exception):
 
 # --- infra: process ---------------------------------------------------------
 
-def run(cmd, cwd=None, check=True, capture=True):
+def run(cmd, cwd=None, check=True, capture=True, stdin=None):
     p = subprocess.run(
-        cmd, cwd=cwd, check=False, text=True,
+        cmd, cwd=cwd, check=False, text=True, input=stdin,
         stdout=subprocess.PIPE if capture else None,
         stderr=subprocess.PIPE if capture else None,
     )
@@ -121,9 +121,10 @@ def run(cmd, cwd=None, check=True, capture=True):
     return p
 
 
-def tmux(*args, check=True, capture=True):
+def tmux(*args, check=True, capture=True, stdin=None):
     """Every tmux call goes through here -- that is what guarantees `-L orq`."""
-    return run(["tmux", "-L", SOCKET, *args], check=check, capture=capture)
+    return run(["tmux", "-L", SOCKET, *args], check=check, capture=capture,
+               stdin=stdin)
 
 
 def git(cwd, *args, check=True):
@@ -608,9 +609,15 @@ def agent_by(sid, pane):
 def paste_into(pane, text, enter=True):
     """Pitfall 4: NOT raw send-keys. A prompt with a line break would submit
     halfway through (Enter is submit in Claude Code) and text containing a key
-    name would be interpreted. set-buffer + paste-buffer -p (bracketed paste)."""
+    name would be interpreted. Buffer + paste-buffer -p (bracketed paste).
+
+    Pitfall 4(b), measured on 2026-09-08: the buffer is filled through STDIN,
+    not as an argument. `set-buffer -- <text>` puts the whole prompt in a tmux
+    command, and tmux caps a command around 16 KB -- a long prompt failed with
+    no useful error. `load-buffer -` reads the same bytes from stdin and took
+    1 MB without complaining."""
     buf = f"orq-{uuid.uuid4().hex[:8]}"
-    tmux("set-buffer", "-b", buf, "--", text)
+    tmux("load-buffer", "-b", buf, "-", stdin=text)
     tmux("paste-buffer", "-d", "-b", buf, "-p", "-t", pane)
     if enter:
         tmux("send-keys", "-t", pane, "Enter")
